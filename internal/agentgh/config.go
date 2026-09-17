@@ -43,6 +43,17 @@ func LoadRoleConfig(role string) (RoleConfig, string, error) {
 	}
 	defer f.Close()
 
+	info, err := f.Stat()
+	if err != nil {
+		return RoleConfig{}, path, fmt.Errorf("inspect config %s: %w", path, err)
+	}
+	if info.IsDir() {
+		return RoleConfig{}, path, fmt.Errorf("config %s is a directory", path)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return RoleConfig{}, path, fmt.Errorf("config %s is readable by other users; run chmod 600 %q", path, path)
+	}
+
 	var config RoleConfig
 	decoder := json.NewDecoder(io.LimitReader(f, 1<<20))
 	decoder.DisallowUnknownFields()
@@ -58,7 +69,7 @@ func LoadRoleConfig(role string) (RoleConfig, string, error) {
 	if config.PrivateKeyPath == "" {
 		return RoleConfig{}, path, fmt.Errorf("config %s: private_key_path is required", path)
 	}
-	config.PrivateKeyPath, err = expandHome(config.PrivateKeyPath)
+	config.PrivateKeyPath, err = resolveKeyPath(configDir, config.PrivateKeyPath)
 	if err != nil {
 		return RoleConfig{}, path, fmt.Errorf("config %s: %w", path, err)
 	}
@@ -109,4 +120,14 @@ func expandHome(path string) (string, error) {
 		return filepath.Join(home, strings.TrimPrefix(path, "~/")), nil
 	}
 	return path, nil
+}
+
+func resolveKeyPath(configDir, path string) (string, error) {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		return expandHome(path)
+	}
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path), nil
+	}
+	return filepath.Clean(filepath.Join(configDir, path)), nil
 }

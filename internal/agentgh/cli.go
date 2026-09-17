@@ -76,7 +76,16 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		}
 	}
 
-	token, _, err := client.CreateInstallationToken(ctx, appJWT, installationID)
+	var tokenRepos []string
+	if repository != "" {
+		_, repoName, err := splitRepository(repository)
+		if err != nil {
+			return err
+		}
+		tokenRepos = []string{repoName}
+	}
+
+	token, _, err := client.CreateInstallationToken(ctx, appJWT, installationID, tokenRepos...)
 	if err != nil {
 		return err
 	}
@@ -138,31 +147,32 @@ func parseArguments(args []string) (execRequest, error) {
 }
 
 func repositoryFromCommand(command []string) string {
-	if len(command) == 0 || filepathBase(command[0]) != "gh" {
+	if len(command) == 0 || command[0] != "gh" {
 		return ""
 	}
 	for index := 1; index < len(command); index++ {
-		switch command[index] {
-		case "-R", "--repo":
+		arg := command[index]
+		if arg == "--" {
+			break
+		}
+		var candidate string
+		switch {
+		case arg == "-R" || arg == "--repo":
 			if index+1 < len(command) {
-				return command[index+1]
+				candidate = command[index+1]
+				index++
 			}
-		default:
-			if strings.HasPrefix(command[index], "--repo=") {
-				return strings.TrimPrefix(command[index], "--repo=")
-			}
-			if strings.HasPrefix(command[index], "-R") && len(command[index]) > 2 {
-				return strings.TrimPrefix(command[index], "-R")
+		case strings.HasPrefix(arg, "--repo="):
+			candidate = strings.TrimPrefix(arg, "--repo=")
+		case strings.HasPrefix(arg, "-R") && len(arg) > 2:
+			candidate = strings.TrimPrefix(arg, "-R")
+		}
+		if candidate != "" && !strings.HasPrefix(candidate, "-") {
+			trimmed := strings.TrimPrefix(candidate, "github.com/")
+			if _, _, err := splitRepository(trimmed); err == nil {
+				return trimmed
 			}
 		}
 	}
 	return ""
-}
-
-func filepathBase(path string) string {
-	parts := strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' })
-	if len(parts) == 0 {
-		return path
-	}
-	return parts[len(parts)-1]
 }

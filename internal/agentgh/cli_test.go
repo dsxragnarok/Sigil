@@ -31,7 +31,12 @@ func TestRepositoryFromCommand(t *testing.T) {
 		{"short joined", []string{"gh", "pr", "view", "-Rdsxragnarok/council"}, "dsxragnarok/council"},
 		{"long separate", []string{"gh", "pr", "view", "--repo", "dsxragnarok/council"}, "dsxragnarok/council"},
 		{"long joined", []string{"gh", "pr", "view", "--repo=dsxragnarok/council"}, "dsxragnarok/council"},
+		{"host prefix stripped", []string{"gh", "pr", "view", "-R", "github.com/dsxragnarok/council"}, "dsxragnarok/council"},
 		{"git", []string{"git", "status"}, ""},
+		{"path bypass gh", []string{"./gh", "pr", "view", "-R", "dsxragnarok/council"}, ""},
+		{"dash dash stop", []string{"gh", "pr", "view", "--", "-R", "dsxragnarok/council"}, ""},
+		{"adjacent flags not a repo", []string{"gh", "issue", "list", "--search", "--repo", "dummy"}, ""},
+		{"repo flag followed by another flag", []string{"gh", "issue", "list", "--repo", "-R"}, ""},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

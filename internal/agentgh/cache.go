@@ -6,10 +6,38 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 type installationCache struct {
 	Roles map[string]map[string]int64 `json:"roles"`
+}
+
+func lockCache(path string, exclusive bool) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create cache directory: %w", err)
+	}
+	lockPath := filepath.Join(filepath.Dir(path), ".installations.lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open cache lock: %w", err)
+	}
+	flag := syscall.LOCK_SH
+	if exclusive {
+		flag = syscall.LOCK_EX
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), flag); err != nil {
+		lockFile.Close()
+		return nil, fmt.Errorf("lock cache: %w", err)
+	}
+	return lockFile, nil
+}
+
+func unlockCache(lockFile *os.File) {
+	if lockFile != nil {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = lockFile.Close()
+	}
 }
 
 func cachedInstallationID(role, repository string) (int64, error) {
@@ -17,6 +45,12 @@ func cachedInstallationID(role, repository string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	lockFile, err := lockCache(path, false)
+	if err != nil {
+		return 0, err
+	}
+	defer unlockCache(lockFile)
+
 	contents, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return 0, nil
@@ -36,6 +70,12 @@ func cacheInstallationID(role, repository string, id int64) error {
 	if err != nil {
 		return err
 	}
+	lockFile, err := lockCache(path, true)
+	if err != nil {
+		return err
+	}
+	defer unlockCache(lockFile)
+
 	cache := installationCache{Roles: make(map[string]map[string]int64)}
 	if contents, readErr := os.ReadFile(path); readErr == nil {
 		if err := json.Unmarshal(contents, &cache); err != nil {

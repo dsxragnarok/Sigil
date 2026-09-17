@@ -11,12 +11,19 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 )
 
 func LoadRSAPrivateKey(path string) (*rsa.PrivateKey, error) {
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open private key %s: %w", path, err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("inspect private key %s: %w", path, err)
 	}
@@ -27,7 +34,7 @@ func LoadRSAPrivateKey(path string) (*rsa.PrivateKey, error) {
 		return nil, fmt.Errorf("private key %s is readable by other users; run chmod 600 %q", path, path)
 	}
 
-	contents, err := os.ReadFile(path)
+	contents, err := io.ReadAll(io.LimitReader(f, 1<<20))
 	if err != nil {
 		return nil, fmt.Errorf("read private key %s: %w", path, err)
 	}
