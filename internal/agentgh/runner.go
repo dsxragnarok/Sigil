@@ -83,7 +83,7 @@ func trustedPath() string {
 	return strings.Join(safe, string(filepath.ListSeparator))
 }
 
-func runChild(ctx context.Context, command []string, token string, stdin io.Reader, stdout, stderr io.Writer) error {
+func runChild(ctx context.Context, command []string, token string, repository string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(command) == 0 {
 		return fmt.Errorf("missing command after --")
 	}
@@ -121,7 +121,7 @@ func runChild(ctx context.Context, command []string, token string, stdin io.Read
 	child.Stdin = stdin
 	child.Stdout = stdout
 	child.Stderr = stderr
-	child.Env = withToken(os.Environ(), token, trustedPathStr)
+	child.Env = withToken(os.Environ(), token, trustedPathStr, repository)
 	if err := child.Run(); err != nil {
 		if exitError, ok := err.(*exec.ExitError); ok {
 			return fmt.Errorf("%s exited with status %d", program, exitError.ExitCode())
@@ -281,7 +281,7 @@ func lookPathIn(file string, pathEnv string) (string, error) {
 	return "", fmt.Errorf("executable %q not found in PATH", file)
 }
 
-func withToken(environment []string, token string, trustedPathStr string) []string {
+func withToken(environment []string, token string, trustedPathStr string, repository string) []string {
 	allowed := map[string]bool{
 		"PATH": true,
 		"HOME": true,
@@ -297,7 +297,7 @@ func withToken(environment []string, token string, trustedPathStr string) []stri
 			continue
 		}
 		key := entry[:eq]
-		if key == "GITHUB_TOKEN" || key == "GH_HOST" || key == "GH_TOKEN" {
+		if key == "GITHUB_TOKEN" || key == "GH_HOST" || key == "GH_TOKEN" || key == "GH_REPO" {
 			continue
 		}
 		if key == "PATH" {
@@ -310,6 +310,9 @@ func withToken(environment []string, token string, trustedPathStr string) []stri
 	}
 	filtered = append(filtered, "PATH="+trustedPathStr)
 	filtered = append(filtered, "GH_TOKEN="+token)
+	if repository != "" {
+		filtered = append(filtered, "GH_REPO="+repository)
+	}
 	filtered = append(filtered, "GIT_CONFIG_NOSYSTEM=1")
 	filtered = append(filtered, "GIT_CONFIG_GLOBAL="+os.DevNull)
 	filtered = append(filtered, "GIT_CONFIG_SYSTEM="+os.DevNull)

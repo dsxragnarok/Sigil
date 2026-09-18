@@ -27,7 +27,7 @@ func TestRunChildLimitsTokenToChildEnvironment(t *testing.T) {
 	setTestTrustedDirs(t, directory)
 	t.Setenv("GH_TOKEN", "parent-token")
 	var output bytes.Buffer
-	if err := runChild(context.Background(), []string{"gh"}, "child-token", strings.NewReader(""), &output, &output); err != nil {
+	if err := runChild(context.Background(), []string{"gh"}, "child-token", "", strings.NewReader(""), &output, &output); err != nil {
 		t.Fatal(err)
 	}
 	if output.String() != "child-token" {
@@ -47,7 +47,7 @@ func TestRunChildRejectsPathBypass(t *testing.T) {
 		`.\gh`,
 	}
 	for _, cmd := range tests {
-		err := runChild(context.Background(), []string{cmd}, "token", nil, &bytes.Buffer{}, &bytes.Buffer{})
+		err := runChild(context.Background(), []string{cmd}, "token", "", nil, &bytes.Buffer{}, &bytes.Buffer{})
 		if err == nil || !strings.Contains(err.Error(), "must be gh or git") {
 			t.Fatalf("expected path bypass error for %q, got %v", cmd, err)
 		}
@@ -55,7 +55,7 @@ func TestRunChildRejectsPathBypass(t *testing.T) {
 }
 
 func TestRunChildRejectsOtherPrograms(t *testing.T) {
-	err := runChild(context.Background(), []string{"sh", "-c", "true"}, "secret", nil, &bytes.Buffer{}, &bytes.Buffer{})
+	err := runChild(context.Background(), []string{"sh", "-c", "true"}, "secret", "", nil, &bytes.Buffer{}, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "must be gh or git") {
 		t.Fatalf("error = %v", err)
 	}
@@ -64,7 +64,7 @@ func TestRunChildRejectsOtherPrograms(t *testing.T) {
 func TestRunChildStripsUnallowedEnvironmentVariables(t *testing.T) {
 	directory := t.TempDir()
 	fakeGH := filepath.Join(directory, "gh")
-	script := "#!/bin/sh\nprintf 'GITHUB_TOKEN=%s GH_HOST=%s AWS_SECRET=%s' \"$GITHUB_TOKEN\" \"$GH_HOST\" \"$AWS_SECRET_ACCESS_KEY\"\n"
+	script := "#!/bin/sh\nprintf 'GITHUB_TOKEN=%s GH_HOST=%s AWS_SECRET=%s GH_REPO=%s' \"$GITHUB_TOKEN\" \"$GH_HOST\" \"$AWS_SECRET_ACCESS_KEY\" \"$GH_REPO\"\n"
 	if err := os.WriteFile(fakeGH, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -72,12 +72,13 @@ func TestRunChildStripsUnallowedEnvironmentVariables(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "leak-github-token")
 	t.Setenv("GH_HOST", "leak-host.com")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "leak-aws-secret")
+	t.Setenv("GH_REPO", "leak-repo")
 
 	var output bytes.Buffer
-	if err := runChild(context.Background(), []string{"gh"}, "child-token", strings.NewReader(""), &output, &output); err != nil {
+	if err := runChild(context.Background(), []string{"gh"}, "child-token", "", strings.NewReader(""), &output, &output); err != nil {
 		t.Fatal(err)
 	}
-	want := "GITHUB_TOKEN= GH_HOST= AWS_SECRET="
+	want := "GITHUB_TOKEN= GH_HOST= AWS_SECRET= GH_REPO="
 	if output.String() != want {
 		t.Fatalf("output = %q, want %q", output.String(), want)
 	}
@@ -93,7 +94,7 @@ func TestRunChildPinsGitAndSshEnvironment(t *testing.T) {
 	setTestTrustedDirs(t, directory)
 
 	var output bytes.Buffer
-	if err := runChild(context.Background(), []string{"gh"}, "token", strings.NewReader(""), &output, &output); err != nil {
+	if err := runChild(context.Background(), []string{"gh"}, "token", "", strings.NewReader(""), &output, &output); err != nil {
 		t.Fatal(err)
 	}
 	want := "NOSYSTEM=1 GLOBAL=" + os.DevNull + " SYSTEM=" + os.DevNull + " SSH_CMD=ssh -F " + os.DevNull + " PAGER=cat GIT_PAGER=cat GIT_EDITOR=true GIT_SEQ_EDITOR=true"
@@ -122,7 +123,7 @@ func TestRunChildIgnoresCallerPathForLookupAndChild(t *testing.T) {
 	t.Setenv("PATH", attackerDir)
 
 	var output bytes.Buffer
-	err := runChild(context.Background(), []string{"gh"}, "token", strings.NewReader(""), &output, &output)
+	err := runChild(context.Background(), []string{"gh"}, "token", "", strings.NewReader(""), &output, &output)
 	if err != nil {
 		t.Fatalf("expected runChild to succeed using trustedDir, got: %v", err)
 	}
@@ -220,7 +221,7 @@ func TestRunChildBlocksGitOverrides(t *testing.T) {
 	}
 
 	for _, cmd := range blocked {
-		err := runChild(context.Background(), cmd, "token", nil, &bytes.Buffer{}, &bytes.Buffer{})
+		err := runChild(context.Background(), cmd, "token", "", nil, &bytes.Buffer{}, &bytes.Buffer{})
 		if err == nil {
 			t.Fatalf("expected git override blocked for %#v, got nil error", cmd)
 		}
@@ -253,7 +254,7 @@ func TestRunChildAllowsSafeGitArguments(t *testing.T) {
 
 	for _, cmd := range allowed {
 		var output bytes.Buffer
-		err := runChild(context.Background(), cmd, "token", strings.NewReader(""), &output, &output)
+		err := runChild(context.Background(), cmd, "token", "", strings.NewReader(""), &output, &output)
 		if err != nil {
 			t.Fatalf("expected safe git command %#v to succeed, got error: %v", cmd, err)
 		}
@@ -262,9 +263,26 @@ func TestRunChildAllowsSafeGitArguments(t *testing.T) {
 
 func TestRunChildFailsWhenNoSafeDirsInTrustedPath(t *testing.T) {
 	setTestTrustedDirs(t, "/nonexistent/directory/that/does/not/exist")
-	err := runChild(context.Background(), []string{"gh"}, "token", strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+	err := runChild(context.Background(), []string{"gh"}, "token", "", strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "no safe directories available in trusted PATH") {
 		t.Fatalf("expected no safe directories error, got: %v", err)
+	}
+}
+
+func TestRunChildSetsGhRepo(t *testing.T) {
+	directory := t.TempDir()
+	fakeGH := filepath.Join(directory, "gh")
+	if err := os.WriteFile(fakeGH, []byte("#!/bin/sh\nprintf '%s' \"$GH_REPO\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	setTestTrustedDirs(t, directory)
+
+	var output bytes.Buffer
+	if err := runChild(context.Background(), []string{"gh"}, "child-token", "dsxragnarok/council", strings.NewReader(""), &output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "dsxragnarok/council" {
+		t.Fatalf("child GH_REPO = %q, want %q", output.String(), "dsxragnarok/council")
 	}
 }
 

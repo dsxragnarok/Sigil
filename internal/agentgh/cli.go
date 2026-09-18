@@ -109,7 +109,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if err != nil {
 		return err
 	}
-	return runChild(ctx, request.command, token, stdin, stdout, stderr)
+	return runChild(ctx, request.command, token, repository, stdin, stdout, stderr)
 }
 
 var errHelp = errors.New("help requested")
