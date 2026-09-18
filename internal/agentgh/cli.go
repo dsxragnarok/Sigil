@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,16 @@ Example:
   agent-gh exec reviewer -- gh pr view 1 -R dsxragnarok/council`
 
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	if stdin == nil {
+		stdin = strings.NewReader("")
+	}
+
 	request, err := parseArguments(args)
 	if err != nil {
 		if errors.Is(err, errHelp) {
@@ -24,6 +35,13 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			return nil
 		}
 		return fmt.Errorf("%w\n\n%s", err, usage)
+	}
+
+	if dir := os.Getenv("AGENT_GH_CONFIG_DIR"); dir != "" {
+		fmt.Fprintf(stderr, "agent-gh: warning: AGENT_GH_CONFIG_DIR is set (%s); overriding config directory\n", dir)
+	}
+	if dir := os.Getenv("AGENT_GH_CACHE_DIR"); dir != "" {
+		fmt.Fprintf(stderr, "agent-gh: warning: AGENT_GH_CACHE_DIR is set (%s); overriding cache directory\n", dir)
 	}
 
 	config, _, err := LoadRoleConfig(request.role)
@@ -83,6 +101,8 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			return err
 		}
 		tokenRepos = []string{repoName}
+	} else {
+		fmt.Fprintln(stderr, "agent-gh: warning: minting unscoped installation token (access to all installation repositories)")
 	}
 
 	token, _, err := client.CreateInstallationToken(ctx, appJWT, installationID, tokenRepos...)

@@ -73,4 +73,11 @@ agent-gh exec implementer -- gh pr create ...
 - The private key stays in the parent helper process.
 - Only the spawned `gh` or `git` process receives `GH_TOKEN`.
 - Tokens never enter command-line arguments, cache files, or helper output.
+- Binary resolution ignores caller `PATH` and searches only trusted system directories (`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`). The child process runs with this sanitized `PATH`.
+- Dangerous `git` arguments are blocked, including `--upload-pack`, `--receive-pack`, `--exec`, `--exec-path`, `--template`, `--git-dir`, `--work-tree`, `--config-env`, `--config`, and `-C` (except for `git commit -C <commit>` message reuse). Flag `-u` is blocked before subcommands and for `git clone`. Configuration overrides via `-c` are restricted to an allowlist of safe families (`user.*`, `pull.*`, `push.*`, `branch.*`, `commit.*`, `tag.*`, `log.*`, `format.*`, `status.*`, `init.*`, `advice.*`, `color.*`, and safe `core.*` line-ending configs).
+- Git and SSH configurations are pinned with `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`, and `GIT_SSH_COMMAND=ssh -F /dev/null`. Pagers and editors are pinned with `GIT_PAGER=cat`, `PAGER=cat`, `GIT_EDITOR=true`, and `GIT_SEQUENCE_EDITOR=true`, and git runs with `--no-pager`. `HOME` remains available for `gh` state.
+- Residual risk: Running `agent-gh` inside an untrusted repository working directory still honors repo-local `.git/config` and `.gitattributes` hooks (such as external diff drivers `diff.external`, filter drivers `filter.*.smudge`, or merge drivers `merge.*.driver`). For maximum safety against untrusted local repositories, invoke `agent-gh` outside untrusted working directories or inspect the repository's `.git/config` and `.gitattributes` beforehand.
+- `AGENT_GH_CONFIG_DIR` and `AGENT_GH_CACHE_DIR` belong to the trusted invoker environment. `agent-gh` prints a warning to stderr when either variable is active.
+- If an installation token is minted without a target repository, `agent-gh` prints a warning to stderr because GitHub grants access across all installation repositories.
 - The requested child command controls its own output. Do not run commands such as `gh auth token` that intentionally print credentials.
+
