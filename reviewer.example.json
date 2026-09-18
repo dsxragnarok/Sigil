@@ -1,5 +1,5 @@
 {
   "client_id": "Iv23liYTtTwOvyDhpyK0",
-  "private_key_path": "~/.config/agent-gh/dsxreviewer.private-key.pem",
+  "private_key_path": "~/.config/sigil/dsxreviewer.private-key.pem",
   "default_repository": "dsxragnarok/council"
 }

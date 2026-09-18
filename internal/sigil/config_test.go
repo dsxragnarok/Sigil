@@ -1,4 +1,4 @@
-package agentgh
+package sigil
 
 import (
 	"os"
@@ -9,7 +9,7 @@ import (
 
 func TestLoadRoleConfigPermissionsAndPathResolution(t *testing.T) {
 	configDir := t.TempDir()
-	t.Setenv("AGENT_GH_CONFIG_DIR", configDir)
+	t.Setenv("SIGIL_CONFIG_DIR", configDir)
 
 	rolePath := filepath.Join(configDir, "reviewer.json")
 	roleJSON := `{
@@ -49,7 +49,7 @@ func TestLoadRoleConfigPermissionsAndPathResolution(t *testing.T) {
 }
 
 func TestResolveKeyPath(t *testing.T) {
-	configDir := "/etc/agent-gh"
+	configDir := "/etc/sigil"
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)

@@ -1,4 +1,4 @@
-package agentgh
+package sigil
 
 import (
 	"bytes"
@@ -51,25 +51,25 @@ func TestRepositoryFromCommand(t *testing.T) {
 }
 
 func TestRunEnvWarnings(t *testing.T) {
-	t.Setenv("AGENT_GH_CONFIG_DIR", "/custom/config")
-	t.Setenv("AGENT_GH_CACHE_DIR", "/custom/cache")
+	t.Setenv("SIGIL_CONFIG_DIR", "/custom/config")
+	t.Setenv("SIGIL_CACHE_DIR", "/custom/cache")
 
 	var stderr bytes.Buffer
 	// Invalid role causes early return after warnings are printed
 	_ = Run(context.Background(), []string{"exec", "reviewer", "--", "gh", "status"}, nil, nil, &stderr)
 
 	output := stderr.String()
-	if !strings.Contains(output, "warning: AGENT_GH_CONFIG_DIR is set (/custom/config)") {
-		t.Fatalf("expected AGENT_GH_CONFIG_DIR warning, got: %q", output)
+	if !strings.Contains(output, "warning: SIGIL_CONFIG_DIR is set (/custom/config)") {
+		t.Fatalf("expected SIGIL_CONFIG_DIR warning, got: %q", output)
 	}
-	if !strings.Contains(output, "warning: AGENT_GH_CACHE_DIR is set (/custom/cache)") {
-		t.Fatalf("expected AGENT_GH_CACHE_DIR warning, got: %q", output)
+	if !strings.Contains(output, "warning: SIGIL_CACHE_DIR is set (/custom/cache)") {
+		t.Fatalf("expected SIGIL_CACHE_DIR warning, got: %q", output)
 	}
 }
 
 func TestRunNilStreamsDoesNotPanic(t *testing.T) {
-	t.Setenv("AGENT_GH_CONFIG_DIR", "/custom/config")
-	t.Setenv("AGENT_GH_CACHE_DIR", "/custom/cache")
+	t.Setenv("SIGIL_CONFIG_DIR", "/custom/config")
+	t.Setenv("SIGIL_CACHE_DIR", "/custom/cache")
 	// Run with nil stdin, stdout, stderr should not panic
 	_ = Run(context.Background(), []string{"exec", "reviewer", "--", "gh", "status"}, nil, nil, nil)
 }

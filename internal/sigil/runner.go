@@ -1,4 +1,4 @@
-package agentgh
+package sigil
 
 import (
 	"context"

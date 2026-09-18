@@ -1,4 +1,4 @@
-package agentgh
+package sigil
 
 import (
 	"context"
@@ -12,10 +12,10 @@ import (
 )
 
 const usage = `Usage:
-  agent-gh exec <role> [--repo owner/name] [--installation-id id] -- <gh|git> [args...]
+  sigil exec <role> [--repo owner/name] [--installation-id id] -- <gh|git> [args...]
 
 Example:
-  agent-gh exec reviewer -- gh pr view 1 -R dsxragnarok/council`
+  sigil exec reviewer -- gh pr view 1 -R dsxragnarok/council`
 
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if stderr == nil {
@@ -37,11 +37,11 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return fmt.Errorf("%w\n\n%s", err, usage)
 	}
 
-	if dir := os.Getenv("AGENT_GH_CONFIG_DIR"); dir != "" {
-		fmt.Fprintf(stderr, "agent-gh: warning: AGENT_GH_CONFIG_DIR is set (%s); overriding config directory\n", dir)
+	if dir := os.Getenv("SIGIL_CONFIG_DIR"); dir != "" {
+		fmt.Fprintf(stderr, "sigil: warning: SIGIL_CONFIG_DIR is set (%s); overriding config directory\n", dir)
 	}
-	if dir := os.Getenv("AGENT_GH_CACHE_DIR"); dir != "" {
-		fmt.Fprintf(stderr, "agent-gh: warning: AGENT_GH_CACHE_DIR is set (%s); overriding cache directory\n", dir)
+	if dir := os.Getenv("SIGIL_CACHE_DIR"); dir != "" {
+		fmt.Fprintf(stderr, "sigil: warning: SIGIL_CACHE_DIR is set (%s); overriding cache directory\n", dir)
 	}
 
 	config, _, err := LoadRoleConfig(request.role)
@@ -102,7 +102,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		}
 		tokenRepos = []string{repoName}
 	} else {
-		fmt.Fprintln(stderr, "agent-gh: warning: minting unscoped installation token (access to all installation repositories)")
+		fmt.Fprintln(stderr, "sigil: warning: minting unscoped installation token (access to all installation repositories)")
 	}
 
 	token, _, err := client.CreateInstallationToken(ctx, appJWT, installationID, tokenRepos...)

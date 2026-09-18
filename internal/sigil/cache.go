@@ -1,4 +1,4 @@
-package agentgh
+package sigil
 
 import (
 	"encoding/json"

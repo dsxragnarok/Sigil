@@ -1,4 +1,4 @@
-package agentgh
+package sigil
 
 import (
 	"fmt"
@@ -7,7 +7,7 @@ import (
 )
 
 func TestInstallationCacheIsScopedByRoleAndRepository(t *testing.T) {
-	t.Setenv("AGENT_GH_CACHE_DIR", t.TempDir())
+	t.Setenv("SIGIL_CACHE_DIR", t.TempDir())
 	if err := cacheInstallationID("reviewer", "dsxragnarok/council", 101); err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestInstallationCacheIsScopedByRoleAndRepository(t *testing.T) {
 }
 
 func TestInstallationCacheConcurrency(t *testing.T) {
-	t.Setenv("AGENT_GH_CACHE_DIR", t.TempDir())
+	t.Setenv("SIGIL_CACHE_DIR", t.TempDir())
 	const numGoroutines = 20
 	errCh := make(chan error, numGoroutines)
 	var wg sync.WaitGroup

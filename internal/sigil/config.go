@@ -1,4 +1,4 @@
-package agentgh
+package sigil
 
 import (
 	"encoding/json"
@@ -77,21 +77,21 @@ func LoadRoleConfig(role string) (RoleConfig, string, error) {
 }
 
 func configDirectory() (string, error) {
-	if dir := os.Getenv("AGENT_GH_CONFIG_DIR"); dir != "" {
+	if dir := os.Getenv("SIGIL_CONFIG_DIR"); dir != "" {
 		return filepath.Abs(dir)
 	}
 	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
-		return filepath.Join(dir, "agent-gh"), nil
+		return filepath.Join(dir, "sigil"), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("find home directory: %w", err)
 	}
-	return filepath.Join(home, ".config", "agent-gh"), nil
+	return filepath.Join(home, ".config", "sigil"), nil
 }
 
 func cacheFilePath() (string, error) {
-	if dir := os.Getenv("AGENT_GH_CACHE_DIR"); dir != "" {
+	if dir := os.Getenv("SIGIL_CACHE_DIR"); dir != "" {
 		absolute, err := filepath.Abs(dir)
 		if err != nil {
 			return "", err
@@ -99,13 +99,13 @@ func cacheFilePath() (string, error) {
 		return filepath.Join(absolute, "installations.json"), nil
 	}
 	if dir := os.Getenv("XDG_CACHE_HOME"); dir != "" {
-		return filepath.Join(dir, "agent-gh", "installations.json"), nil
+		return filepath.Join(dir, "sigil", "installations.json"), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("find home directory: %w", err)
 	}
-	return filepath.Join(home, ".cache", "agent-gh", "installations.json"), nil
+	return filepath.Join(home, ".cache", "sigil", "installations.json"), nil
 }
 
 func expandHome(path string) (string, error) {

@@ -1,3 +1,3 @@
-module agent-gh
+module sigil
 
 go 1.23
