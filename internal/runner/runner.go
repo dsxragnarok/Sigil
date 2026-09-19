@@ -333,9 +333,10 @@ func lookPathIn(file string, pathEnv string) (string, error) {
 }
 
 // redactWriter scrubs bearer material from a streaming child output.
-// The token may split across Write calls, so up to len(token)-1 trailing
-// bytes are held back until the next Write or Flush. Flush must run after
-// the child exits to emit the tail scrubbed.
+// To avoid deadlocking interactive commands by buffering short prompts, it
+// retains only the longest trailing suffix that could be a prefix of the
+// token, emitting non-matching prefixes immediately. Flush must run after
+// the child exits to emit any remaining trailing bytes.
 type redactWriter struct {
 	w     io.Writer
 	token []byte
@@ -347,16 +348,28 @@ func newRedactWriter(w io.Writer, token string) *redactWriter {
 	return &redactWriter{w: w, token: []byte(token), repl: []byte("[REDACTED]")}
 }
 
+// longestMatchingPrefix returns the length of the longest trailing suffix of
+// buf that is a proper prefix of token.
+func longestMatchingPrefix(buf, token []byte) int {
+	maxCheck := len(token) - 1
+	if len(buf) < maxCheck {
+		maxCheck = len(buf)
+	}
+	for l := maxCheck; l > 0; l-- {
+		if bytes.Equal(buf[len(buf)-l:], token[:l]) {
+			return l
+		}
+	}
+	return 0
+}
+
 func (r *redactWriter) Write(p []byte) (int, error) {
 	if len(r.token) == 0 {
 		return r.w.Write(p)
 	}
 	r.buf = append(r.buf, p...)
 	r.buf = bytes.ReplaceAll(r.buf, r.token, r.repl)
-	keep := len(r.token) - 1
-	if keep < 0 {
-		keep = 0
-	}
+	keep := longestMatchingPrefix(r.buf, r.token)
 	if len(r.buf) <= keep {
 		return len(p), nil
 	}
@@ -367,16 +380,14 @@ func (r *redactWriter) Write(p []byte) (int, error) {
 		wrote += n
 		if err != nil {
 			// Keep unwritten tail (including flushed-prefix remainder) buffered.
-			remaining := append([]byte(nil), r.buf[wrote:]...)
-			r.buf = remaining
+			r.buf = append([]byte(nil), r.buf[wrote:]...)
 			return 0, err
 		}
 		if n == 0 {
 			break
 		}
 	}
-	remaining := append([]byte(nil), r.buf[flushUpTo:]...)
-	r.buf = remaining
+	r.buf = append([]byte(nil), r.buf[wrote:]...)
 	return len(p), nil
 }
 

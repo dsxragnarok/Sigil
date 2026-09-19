@@ -75,9 +75,9 @@ trusted/admin caller
   -> chunked stdout/stderr/exit stream
 ```
 
-The caller never receives the GitHub token.
+The caller never receives the GitHub token directly from the broker.
 
-M1 retains explicit role selection only as a **trusted/admin compatibility path**. It is not an agent role-isolation boundary. Untrusted agents use role-bound sessions beginning in M2.
+M1 retains explicit role selection only as a **trusted/admin compatibility path**. It is not an agent role-isolation boundary. Untrusted agents use role-bound sessions beginning in M2. Adversarial child-output secrecy is out of scope for M1 (see Section 1.2 Framing and M2 prerequisites).
 
 ## 1.1 Add `cmd/sigild`
 
@@ -171,7 +171,7 @@ Stream requirements:
 - stdout and stderr remain distinct;
 - preserve frame order as emitted by each stream, without claiming a total ordering between stdout and stderr;
 - the final success-path frame is exactly one `exit` frame;
-- credentials never appear in any frame.
+- credentials are never placed in broker-originated frames (metadata, error, exit) or logs; child stdout and stderr frames are scrubbed per-stream of the exact raw token as defense in depth against accidental echo. Adversarial child-output secrecy (cross-stream reconstruction or encoded exfiltration by code inheriting `GH_TOKEN`) is out of scope for M1.
 
 ### Request and stream bounds
 
@@ -503,8 +503,10 @@ sigil CLI -> sigil-admin.sock -> sigild -> provider -> runner
 
 Verify that:
 
-- client process never receives provider token;
-- token does not appear in request/response frames;
+- in legitimate use, client process never receives provider token;
+- token does not appear in broker-originated request/response frames;
+- direct appearances in child stdout/stderr are scrubbed per-stream as defense in depth against accidental echo;
+- cross-stream bearer fragmentation by adversarial child code is tested and documented as an M1 limitation (see M2 prerequisites);
 - role config is resolved only by broker;
 - client `SIGIL_CONFIG_DIR` / `SIGIL_CACHE_DIR` cannot redirect daemon state;
 - streamed stdin reaches the child;
@@ -545,6 +547,7 @@ M1 is complete when all of the following are true:
 - broker-spawned Git always disables repository hooks with `core.hooksPath=/dev/null`;
 - validated `working_dir` cannot escape approved workspace roots;
 - reviewer/implementer/tester configs are explicit and role-neutral;
+- per-stream output redaction is defense in depth against accidental echo, while adversarial child-output secrecy is documented as out of scope for M1 and a hard prerequisite before M2 exposes compatibility execution to untrusted agents;
 - all automated tests pass;
 - README/documentation is updated for broker startup and trusted/admin usage.
 
@@ -555,6 +558,14 @@ M1 is complete when all of the following are true:
 ## Goal
 
 Remove role selection from the untrusted agent and separate launcher authority from agent execution authority.
+
+### Hard prerequisite: Credential isolation before untrusted compatibility execution
+
+In M1, compatibility execution injects `GH_TOKEN` into the child process environment, where repo-local Git configuration (such as `alias.* = "!..."`, custom filter drivers, or diff drivers) can execute shell commands that inherit the token. Independent stream redactors cannot prevent an adversarial child from fragmenting or encoding the token across output streams or exfiltrating over network.
+
+Therefore, **M2 must not expose the M1 compatibility execution path unchanged to untrusted agents**. Before compatibility execution is made available to untrusted sessions, M2 requires either:
+1. **Credential helper isolation**: `sigild` acts as an out-of-process credential helper for `git` so that `GH_TOKEN` is never placed into the child process environment; or
+2. **Native typed operations**: the broker executes provider operations directly rather than delegating command execution to a subprocess with raw credentials.
 
 Trusted launcher:
 
