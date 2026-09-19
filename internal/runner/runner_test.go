@@ -92,8 +92,13 @@ func TestPersonalCredentialEnvScrubbed(t *testing.T) {
 		t.Fatalf("code=%d err=%v", code, err)
 	}
 	got := out.String()
-	if !strings.Contains(got, "GH_TOKEN=child-token") {
-		t.Fatalf("broker token not injected: %q", got)
+	// Broker token is injected into the child env but must never cross IPC
+	// via output: stdout is scrubbed, so the raw token must not appear.
+	if strings.Contains(got, "child-token") {
+		t.Fatalf("broker token leaked to output: %q", got)
+	}
+	if !strings.Contains(got, "GH_TOKEN=[REDACTED]") {
+		t.Fatalf("expected redacted broker token in %q", got)
 	}
 	for _, leak := range []string{"leak-github", "leak-enterprise", "leak-wild", "leak-app", "leak-host.example", "/leak/agent.sock", "leak/repo"} {
 		if strings.Contains(got, leak) {
@@ -102,6 +107,53 @@ func TestPersonalCredentialEnvScrubbed(t *testing.T) {
 	}
 	if !strings.Contains(got, "REPO=o/r") {
 		t.Fatalf("broker repository not set: %q", got)
+	}
+}
+
+func TestBrokerTokenNeverAppearsInStreams(t *testing.T) {
+	dir := t.TempDir()
+	// Fake gh echoes the token on both streams, fragmented across writes to
+	// exercise the streaming redactor (token split mid-write).
+	writeFake(t, dir, "gh", "#!/bin/sh\ntok=\"$GH_TOKEN\"\n# Split into two writes: first half stdout, second half stdout, full token stderr.\nlen=$(printf '%s' \"$tok\" | /usr/bin/wc -c)\nhalf=$((len / 2))\nprintf '%s' \"$tok\" | /bin/dd bs=1 count=$half 2>/dev/null\nprintf '%s' \"$tok\" | /bin/dd bs=1 skip=$half 2>/dev/null\nprintf '%s' \"$tok\" >&2\n")
+	setTestTrustedDirs(t, dir)
+	token := "ghs_split-token-abc123"
+
+	var out, errOut bytes.Buffer
+	code, err := Run(context.Background(), Request{Command: []string{"gh"}, Token: token, Stdout: &out, Stderr: &errOut})
+	if err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	combined := out.String() + errOut.String()
+	if strings.Contains(combined, token) {
+		t.Fatalf("credential in streams: %q", combined)
+	}
+	if !strings.Contains(combined, "[REDACTED]") {
+		t.Fatalf("expected redaction marker in %q", combined)
+	}
+}
+
+func TestGhAuthDisclosureRejected(t *testing.T) {
+	dir := t.TempDir()
+	writeFake(t, dir, "gh", "#!/bin/sh\nexit 0\n")
+	setTestTrustedDirs(t, dir)
+	blocked := [][]string{
+		{"gh", "auth", "token"},
+		{"gh", "auth", "status"},
+		{"gh", "auth", "status", "--show-token"},
+		{"gh", "auth", "login"},
+		{"gh", "-R", "o/r", "auth", "token"},
+		{"gh", "auth", "git-credential"},
+	}
+	for _, cmd := range blocked {
+		if _, err := Run(context.Background(), Request{Command: cmd, Token: "t"}); err == nil {
+			t.Fatalf("expected rejection for %#v", cmd)
+		} else if strings.Contains(err.Error(), "t") && len("t") > 1 {
+			t.Fatalf("credential in error for %#v: %v", cmd, err)
+		}
+	}
+	// --show-token is denied even outside auth as defense in depth.
+	if _, err := Run(context.Background(), Request{Command: []string{"gh", "pr", "view", "--show-token"}, Token: "t"}); err == nil {
+		t.Fatal("expected rejection for --show-token")
 	}
 }
 

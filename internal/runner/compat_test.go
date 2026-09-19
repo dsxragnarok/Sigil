@@ -42,8 +42,13 @@ func TestCompatTokenLimitedToChildEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "child-token" {
-		t.Fatalf("child token = %q", got)
+	// Child receives the broker token via env, but output is scrubbed so the
+	// raw bearer never crosses IPC to the caller.
+	if strings.Contains(got, "child-token") {
+		t.Fatalf("broker token leaked to caller: %q", got)
+	}
+	if got != "[REDACTED]" {
+		t.Fatalf("child output = %q, want redacted bearer", got)
 	}
 	if parent := os.Getenv("GH_TOKEN"); parent != "parent-token" {
 		t.Fatalf("parent GH_TOKEN changed to %q", parent)

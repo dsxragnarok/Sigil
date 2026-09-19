@@ -136,6 +136,8 @@ func TestUnknownRoleMalformedRepoFailClosed(t *testing.T) {
 		"bad program":   {Role: "reviewer", Repository: "o/r", WorkingDir: workspace, Command: []string{"sh", "-c", "x"}},
 		"no command":    {Role: "reviewer", Repository: "o/r", WorkingDir: workspace},
 		"git needs dir": {Role: "reviewer", Repository: "o/r", Command: []string{"git", "status"}},
+		"gh auth token": {Role: "reviewer", Repository: "o/r", WorkingDir: workspace, Command: []string{"gh", "auth", "token"}},
+		"gh auth show":  {Role: "reviewer", Repository: "o/r", WorkingDir: workspace, Command: []string{"gh", "auth", "status", "--show-token"}},
 	} {
 		if _, err := b.Exec(context.Background(), req, nil, io.Discard, io.Discard); err == nil {
 			t.Fatalf("%s: expected error", name)

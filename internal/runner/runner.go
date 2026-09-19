@@ -3,10 +3,13 @@
 // GH_CONFIG_DIR, scrubbed personal-credential environment, suppressed Git
 // hooks, an explicit canonical working directory, and its own process group
 // so timeouts reap the whole tree. Credentials never appear in argv, temp
-// files, streams, or error strings.
+// files, or error strings; child stdout/stderr is scrubbed of the broker
+// token and `gh auth` disclosure commands are rejected so bearer material
+// cannot cross IPC via output frames.
 package runner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -68,6 +71,11 @@ func Run(ctx context.Context, req Request) (int, error) {
 		return 0, fmt.Errorf("command must be gh or git, got %q", program)
 	}
 	arguments := append([]string(nil), req.Command[1:]...)
+	if program == "gh" {
+		if err := ValidateGhArguments(arguments); err != nil {
+			return 0, err
+		}
+	}
 	if program == "git" {
 		if err := ValidateGitArguments(arguments); err != nil {
 			return 0, err
@@ -133,6 +141,19 @@ func Run(ctx context.Context, req Request) (int, error) {
 	if stderr == nil {
 		stderr = io.Discard
 	}
+	// Bearer material must never cross IPC via child output. The broker
+	// credential lives in the child environment (required for gh/git HTTPS),
+	// so `gh auth token`, repo-local `!` aliases (`!env`, `!echo $GH_TOKEN`),
+	// or helpers could otherwise echo it to stdout/stderr frames. Wrap both
+	// streams with a token-scrubbing filter; `gh auth` disclosure commands
+	// are rejected above, this is defense in depth for arbitrary output.
+	var stdoutFilter, stderrFilter *redactWriter
+	if req.Token != "" {
+		stdoutFilter = newRedactWriter(stdout, req.Token)
+		stderrFilter = newRedactWriter(stderr, req.Token)
+		stdout = stdoutFilter
+		stderr = stderrFilter
+	}
 
 	child := exec.CommandContext(ctx, targetBinary, arguments...)
 	child.Dir = dir
@@ -147,6 +168,14 @@ func Run(ctx context.Context, req Request) (int, error) {
 
 	if err := child.Start(); err != nil {
 		return 0, fmt.Errorf("run %s: %w", program, err)
+	}
+	// Flush redaction buffers on every exit path so trailing bytes (up to
+	// len(token)-1 held to catch split-token writes) are emitted scrubbed.
+	if stdoutFilter != nil {
+		defer func() { _ = stdoutFilter.Flush() }()
+	}
+	if stderrFilter != nil {
+		defer func() { _ = stderrFilter.Flush() }()
 	}
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- child.Wait() }()
@@ -300,6 +329,67 @@ func lookPathIn(file string, pathEnv string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("executable %q not found in PATH", file)
+}
+
+// redactWriter scrubs bearer material from a streaming child output.
+// The token may split across Write calls, so up to len(token)-1 trailing
+// bytes are held back until the next Write or Flush. Flush must run after
+// the child exits to emit the tail scrubbed.
+type redactWriter struct {
+	w     io.Writer
+	token []byte
+	repl  []byte
+	buf   []byte
+}
+
+func newRedactWriter(w io.Writer, token string) *redactWriter {
+	return &redactWriter{w: w, token: []byte(token), repl: []byte("[REDACTED]")}
+}
+
+func (r *redactWriter) Write(p []byte) (int, error) {
+	if len(r.token) == 0 {
+		return r.w.Write(p)
+	}
+	r.buf = append(r.buf, p...)
+	r.buf = bytes.ReplaceAll(r.buf, r.token, r.repl)
+	keep := len(r.token) - 1
+	if keep < 0 {
+		keep = 0
+	}
+	if len(r.buf) <= keep {
+		return len(p), nil
+	}
+	flushUpTo := len(r.buf) - keep
+	wrote := 0
+	for wrote < flushUpTo {
+		n, err := r.w.Write(r.buf[wrote:flushUpTo])
+		wrote += n
+		if err != nil {
+			// Keep unwritten tail (including flushed-prefix remainder) buffered.
+			remaining := append([]byte(nil), r.buf[wrote:]...)
+			r.buf = remaining
+			return 0, err
+		}
+		if n == 0 {
+			break
+		}
+	}
+	remaining := append([]byte(nil), r.buf[flushUpTo:]...)
+	r.buf = remaining
+	return len(p), nil
+}
+
+// Flush emits any held-back tail, scrubbed. Call after child exit.
+func (r *redactWriter) Flush() error {
+	if len(r.buf) == 0 {
+		return nil
+	}
+	if len(r.token) > 0 {
+		r.buf = bytes.ReplaceAll(r.buf, r.token, r.repl)
+	}
+	_, err := r.w.Write(r.buf)
+	r.buf = nil
+	return err
 }
 
 // childEnv builds the sanitized child environment: a small allowlist plus

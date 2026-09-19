@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"sync"
 	"syscall"
-	"time"
 )
 
 // Executor runs one validated execution, streaming IO. It returns the target
@@ -216,23 +215,20 @@ func serveExec(w http.ResponseWriter, r *http.Request, exec Executor) {
 	stderr := writerFunc(func(p []byte) (int, error) { write(TypeStderr, p); return len(p), nil })
 
 	code, err := exec.Exec(ctx, meta, stdinReader, stdout, stderr)
-	// Execution completion must not require the caller's stdin source to
-	// reach EOF (e.g. terminal stdin via `sigil exec ...` never closes).
-	// Fail closed on malformed streams already observed, but do not wait for
-	// terminal EOF: a brief grace catches in-flight malformed/truncated
-	// frames, while a still-blocked uploader is treated as terminal input,
-	// not a truncation. Handler return closes the request body and terminates
-	// the scanner goroutine.
+	// Deterministic lifecycle: target exit terminates the request-input
+	// side, so `stdin_eof` is no longer required once the child has exited.
+	// Fail closed only on malformed streams already observed before exec
+	// returned; a still-blocked uploader is terminal stdin still open (e.g.
+	// `sigil exec ...` with a terminal that never closes), not a truncation.
+	// No wall-clock grace: handler return closes the request body and
+	// terminates the scanner goroutine, so late frames after exit are
+	// irrelevant by definition rather than raced against a timer.
 	_ = stdinReader.Close()
 	var scanResult error
 	select {
 	case scanResult = <-scanErr:
 	default:
-		select {
-		case scanResult = <-scanErr:
-		case <-time.After(100 * time.Millisecond):
-			scanResult = nil
-		}
+		scanResult = nil
 	}
 
 	mu.Lock()
