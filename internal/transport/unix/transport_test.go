@@ -159,6 +159,48 @@ func TestMalformedStdinStreamFailsClosed(t *testing.T) {
 	}
 }
 
+func TestImmediateExitWithPrebufferedMalformedStdin(t *testing.T) {
+	// Narrowed error model: target exit terminates request-input consumption;
+	// unconsumed request input following child exit is discarded without
+	// evaluation. When an executor exits immediately without reading stdin,
+	// pre-buffered bogus frames are not consumed, so the target exit code is
+	// returned deterministically without scheduler-dependent races.
+	exec := ExecutorFunc(func(ctx context.Context, meta Meta, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+		return 0, nil
+	})
+	server := httptest.NewServer(AdminHandler(exec))
+	defer server.Close()
+	meta, _ := EncodeMeta(Meta{Role: "reviewer", Command: []string{"gh"}})
+	bogus, _ := EncodeFrame(Frame{Type: "bogus"})
+	eof, _ := EncodeFrame(Frame{Type: TypeStdinEOF})
+	resp, err := server.Client().Post(server.URL+"/v1/exec", "application/x-ndjson",
+		io.MultiReader(bytes.NewReader(meta), bytes.NewReader(bogus), bytes.NewReader(eof)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for immediate exit with unconsumed stdin, got %d", resp.StatusCode)
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	foundExit := false
+	for scanner.Scan() {
+		frame, err := DecodeFrame(scanner.Bytes())
+		if err != nil {
+			t.Fatalf("decode response frame: %v", err)
+		}
+		if frame.Type == TypeExit {
+			foundExit = true
+			if frame.Code == nil || *frame.Code != 0 {
+				t.Fatalf("exit code = %v, want 0", frame.Code)
+			}
+		}
+	}
+	if !foundExit {
+		t.Fatal("missing exit frame")
+	}
+}
+
 func TestOversizedFirstLineRejected(t *testing.T) {
 	called := false
 	exec := ExecutorFunc(func(ctx context.Context, meta Meta, stdin io.Reader, stdout, stderr io.Writer) (int, error) {

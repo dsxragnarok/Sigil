@@ -58,6 +58,7 @@ func AgentHandler() http.Handler {
 }
 
 func writeErrorFrame(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Connection", "close")
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.WriteHeader(status)
 	line, _ := EncodeFrame(Frame{Type: TypeError, Message: message})
@@ -65,6 +66,9 @@ func writeErrorFrame(w http.ResponseWriter, status int, message string) {
 }
 
 func serveExec(w http.ResponseWriter, r *http.Request, exec Executor) {
+	w.Header().Set("Connection", "close")
+	r.Close = true
+
 	// Full duplex is required for interactive use: the executor may write a
 	// prompt and flush before the client has finished uploading stdin. Without
 	// this, Go's HTTP/1 server waits for request EOF before starting the
@@ -95,11 +99,10 @@ func serveExec(w http.ResponseWriter, r *http.Request, exec Executor) {
 	defer cancel()
 
 	stdinReader, stdinWriter := io.Pipe()
-	scanErr := make(chan error, 1)
+	tracker := &stdinTracker{r: stdinReader}
 	go func() {
 		defer stdinWriter.Close()
 		var total int64
-		writeClosed := false
 		scanner := bufio.NewScanner(rest)
 		scanner.Buffer(make([]byte, 64*1024), MaxStreamFrameBytes+1024)
 		for scanner.Scan() {
@@ -109,7 +112,6 @@ func serveExec(w http.ResponseWriter, r *http.Request, exec Executor) {
 			}
 			frame, err := DecodeFrame(append([]byte(nil), line...))
 			if err != nil {
-				scanErr <- err
 				_ = stdinWriter.CloseWithError(err)
 				return
 			}
@@ -117,44 +119,32 @@ func serveExec(w http.ResponseWriter, r *http.Request, exec Executor) {
 			case TypeStdin:
 				data, err := DecodeData(frame)
 				if err != nil {
-					scanErr <- err
 					_ = stdinWriter.CloseWithError(err)
 					return
 				}
 				total += int64(len(data))
 				if total > MaxStdinBytes {
 					err := fmt.Errorf("stdin exceeds %d byte limit", MaxStdinBytes)
-					scanErr <- err
 					_ = stdinWriter.CloseWithError(err)
 					return
 				}
-				if writeClosed {
-					continue
-				}
 				if _, err := stdinWriter.Write(data); err != nil {
-					if errors.Is(err, io.ErrClosedPipe) {
-						writeClosed = true
-						continue
-					}
-					scanErr <- err
+					// Target process exited or closed its stdin reader.
 					return
 				}
 			case TypeStdinEOF:
-				scanErr <- nil
 				return
 			default:
 				err := fmt.Errorf("unexpected request frame %q", frame.Type)
-				scanErr <- err
 				_ = stdinWriter.CloseWithError(err)
 				return
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			scanErr <- err
 			_ = stdinWriter.CloseWithError(err)
 			return
 		}
-		scanErr <- fmt.Errorf("request ended without stdin_eof")
+		_ = stdinWriter.CloseWithError(fmt.Errorf("request ended without stdin_eof"))
 	}()
 
 	// Headers are set now, but the 200 status is written lazily on the first
@@ -214,22 +204,12 @@ func serveExec(w http.ResponseWriter, r *http.Request, exec Executor) {
 	stdout := writerFunc(func(p []byte) (int, error) { write(TypeStdout, p); return len(p), nil })
 	stderr := writerFunc(func(p []byte) (int, error) { write(TypeStderr, p); return len(p), nil })
 
-	code, err := exec.Exec(ctx, meta, stdinReader, stdout, stderr)
-	// Deterministic lifecycle: target exit terminates the request-input
-	// side, so `stdin_eof` is no longer required once the child has exited.
-	// Fail closed only on malformed streams already observed before exec
-	// returned; a still-blocked uploader is terminal stdin still open (e.g.
-	// `sigil exec ...` with a terminal that never closes), not a truncation.
-	// No wall-clock grace: handler return closes the request body and
-	// terminates the scanner goroutine, so late frames after exit are
-	// irrelevant by definition rather than raced against a timer.
+	code, err := exec.Exec(ctx, meta, tracker, stdout, stderr)
+	// Target exit terminates request-input consumption: unconsumed request
+	// input following child exit is discarded. Closing stdinReader breaks any
+	// pending write in the scanner goroutine so it exits promptly without
+	// evaluating unconsumed trailing frames.
 	_ = stdinReader.Close()
-	var scanResult error
-	select {
-	case scanResult = <-scanErr:
-	default:
-		scanResult = nil
-	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -241,11 +221,11 @@ func serveExec(w http.ResponseWriter, r *http.Request, exec Executor) {
 		finishError(http.StatusBadGateway, outErr)
 		return
 	}
-	// Fail closed on malformed request streams even when the executor
-	// reported success: a truncated or limit-violating stdin must never
-	// present as a clean run.
-	if scanResult != nil {
-		finishError(http.StatusBadRequest, scanResult)
+	// Fail closed on malformed request streams observed while feeding the
+	// running executor: corrupted or limit-violating stdin consumed by the
+	// target must never present as a clean run.
+	if trackerErr := tracker.Err(); trackerErr != nil {
+		finishError(http.StatusBadRequest, trackerErr)
 		return
 	}
 	ensureOK()
@@ -281,6 +261,30 @@ func readFirstLine(body io.Reader) ([]byte, io.Reader, error) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+type stdinTracker struct {
+	mu  sync.Mutex
+	r   io.Reader
+	err error
+}
+
+func (t *stdinTracker) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if err != nil && err != io.EOF && !errors.Is(err, io.ErrClosedPipe) {
+		t.mu.Lock()
+		if t.err == nil {
+			t.err = err
+		}
+		t.mu.Unlock()
+	}
+	return n, err
+}
+
+func (t *stdinTracker) Err() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.err
+}
 
 func trimNewline(line []byte) []byte {
 	for len(line) > 0 && (line[len(line)-1] == '\n' || line[len(line)-1] == '\r') {
