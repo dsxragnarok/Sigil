@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -413,3 +414,181 @@ func TestDangerousGitFlagsRejected(t *testing.T) {
 		}
 	}
 }
+
+func TestLongestMatchingPrefix(t *testing.T) {
+	tests := []struct {
+		buf   string
+		token string
+		want  int
+	}{
+		{"", "ghs_token", 0},
+		{"prompt> ", "ghs_token", 0},
+		{"prefix ghs_", "ghs_token", 4},
+		{"prefix ghs_tok", "ghs_token", 7},
+		{"ghs_token", "ghs_token", 0},
+		{"abc", "def", 0},
+		{"hello a", "aba", 1},
+		{"hello ab", "aba", 2},
+		{"hello aba", "aba", 1},
+	}
+	for _, tc := range tests {
+		got := longestMatchingPrefix([]byte(tc.buf), []byte(tc.token))
+		if got != tc.want {
+			t.Errorf("longestMatchingPrefix(%q, %q) = %d, want %d", tc.buf, tc.token, got, tc.want)
+		}
+	}
+}
+
+func TestRedactWriterEmitsShortPromptImmediately(t *testing.T) {
+	var out bytes.Buffer
+	token := "ghs_1234567890abcdef"
+	rw := newRedactWriter(&out, token)
+
+	prompt := "prompt> "
+	n, err := rw.Write([]byte(prompt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(prompt) {
+		t.Fatalf("wrote %d, want %d", n, len(prompt))
+	}
+	// Prompt must be emitted immediately without waiting for Flush() or EOF.
+	if out.String() != prompt {
+		t.Fatalf("expected prompt immediately in out, got %q", out.String())
+	}
+}
+
+func TestRedactWriterBuffersOnlyTokenPrefix(t *testing.T) {
+	var out bytes.Buffer
+	token := "ghs_12345"
+	rw := newRedactWriter(&out, token)
+
+	_, err := rw.Write([]byte("hello ghs_"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "hello " {
+		t.Fatalf("expected %q, got %q", "hello ", out.String())
+	}
+
+	_, err = rw.Write([]byte("12345 rest"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "hello [REDACTED] rest" {
+		t.Fatalf("expected %q, got %q", "hello [REDACTED] rest", out.String())
+	}
+}
+
+func TestRedactWriterEmitsFalsePrefixOnNextWrite(t *testing.T) {
+	var out bytes.Buffer
+	token := "ghs_12345"
+	rw := newRedactWriter(&out, token)
+
+	_, err := rw.Write([]byte("hello ghs_"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "hello " {
+		t.Fatalf("expected %q, got %q", "hello ", out.String())
+	}
+
+	_, err = rw.Write([]byte("not_token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "hello ghs_not_token" {
+		t.Fatalf("expected %q, got %q", "hello ghs_not_token", out.String())
+	}
+}
+
+func TestRedactWriterEmitsTailOnFlush(t *testing.T) {
+	var out bytes.Buffer
+	token := "ghs_12345"
+	rw := newRedactWriter(&out, token)
+
+	_, err := rw.Write([]byte("hello ghs_"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "hello " {
+		t.Fatalf("expected %q, got %q", "hello ", out.String())
+	}
+
+	if err := rw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "hello ghs_" {
+		t.Fatalf("expected %q, got %q", "hello ghs_", out.String())
+	}
+}
+
+func TestInteractivePromptObservableBeforeStdinSupplied(t *testing.T) {
+	dir := t.TempDir()
+	prompt := "prompt> "
+	token := "ghs_this-is-a-very-long-token-that-exceeds-the-prompt-length-by-far-1234567890"
+	if len(prompt) >= len(token) {
+		t.Fatalf("prompt length (%d) must be strictly less than token length (%d)", len(prompt), len(token))
+	}
+	writeFake(t, dir, "gh", "#!/bin/sh\n"+
+		"printf 'prompt> '\n"+
+		"read answer\n"+
+		"printf 'reply:%s\\n' \"$answer\"\n")
+	setTestTrustedDirs(t, dir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stdinR, stdinW := io.Pipe()
+	stdoutR, stdoutW := io.Pipe()
+
+	runErrCh := make(chan error, 1)
+	runCodeCh := make(chan int, 1)
+
+	go func() {
+		code, err := Run(ctx, Request{
+			Command: []string{"gh"},
+			Token:   token,
+			Stdin:   stdinR,
+			Stdout:  stdoutW,
+		})
+		_ = stdoutW.Close()
+		runCodeCh <- code
+		runErrCh <- err
+	}()
+
+	// 1. Read prompt from stdout before supplying any stdin.
+	promptBuf := make([]byte, len(prompt))
+	if _, err := io.ReadFull(stdoutR, promptBuf); err != nil {
+		t.Fatalf("failed to read prompt before supplying stdin: %v", err)
+	}
+	if string(promptBuf) != prompt {
+		t.Fatalf("expected prompt %q, got %q", prompt, string(promptBuf))
+	}
+
+	// 2. Supply stdin only after prompt is observed.
+	if _, err := io.WriteString(stdinW, "confirm-action\n"); err != nil {
+		t.Fatalf("failed to write to stdin: %v", err)
+	}
+	_ = stdinW.Close()
+
+	// 3. Read remaining stdout.
+	remaining, err := io.ReadAll(stdoutR)
+	if err != nil {
+		t.Fatalf("failed to read remaining stdout: %v", err)
+	}
+	if !strings.Contains(string(remaining), "reply:confirm-action") {
+		t.Fatalf("expected reply:confirm-action, got %q", string(remaining))
+	}
+
+	// 4. Verify clean exit.
+	runErr := <-runErrCh
+	runCode := <-runCodeCh
+	if runErr != nil {
+		t.Fatalf("Run failed: %v", runErr)
+	}
+	if runCode != 0 {
+		t.Fatalf("Run exit code = %d, want 0", runCode)
+	}
+}
+

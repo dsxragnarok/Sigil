@@ -396,7 +396,8 @@ Required controls:
 - dangerous Git flags and unsafe config overrides are rejected;
 - the working directory is explicit, canonicalized, must exist, and must fall under a broker/session-approved workspace root;
 - Git hooks are disabled for every broker-spawned Git process with `-c core.hooksPath=/dev/null`;
-- credentials are never placed in argv, IPC responses, logs, or persistent files;
+- credentials are never placed in argv, broker-originated IPC responses or errors, logs, or persistent files;
+- child stdout and stderr are scrubbed per-stream of the exact raw token as defense in depth against accidental echo;
 - child processes run in their own process group so timeout cancellation can terminate the entire tree.
 
 The review proposed additionally injecting a global Git `--no-hooks` flag. Current Git does not define `--no-hooks` as a global option; the supported all-hooks suppression mechanism is `-c core.hooksPath=/dev/null`. Sigil must enforce the security intent rather than emit an unsupported argument. Command-specific no-hook/no-verify flags may be added only where Git documents them and they provide defense in depth.
@@ -435,9 +436,13 @@ agent
   -> chunked stdout/stderr/exit frames
 ```
 
-The agent never receives the token directly.
+The agent never receives the token directly from the broker.
 
 M1 explicit role selection is an administrative compatibility path, not a role-isolation boundary for an untrusted same-user agent. Role integrity for agents begins with M2 sessions.
+
+In M1, compatibility execution injects `GH_TOKEN` into the child process environment because compatibility tools (`gh` and `git` HTTPS credential helpers) require it. Per-stream scrubbing removes exact token occurrences from stdout and stderr as defense in depth against accidental echo. Adversarial child-output secrecy (preventing intentional exfiltration via cross-stream bearer splitting, encoding, or repo-local Git configuration such as `alias.* = "!..."` or custom filter/diff drivers) is explicitly out of scope for M1.
+
+**Hard prerequisite for M2:** M2 must not inherit the M1 compatibility execution path unchanged if token secrecy is a security goal. Given that repo-local Git config can execute code inheriting `GH_TOKEN`, exposing compatibility execution to untrusted agents requires credential helper isolation (where `sigild` handles authentication without placing the raw provider token in the child environment) or native typed operations where the child never possesses provider credentials.
 
 ### 6.2 Native typed operations
 

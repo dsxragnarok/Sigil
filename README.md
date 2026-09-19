@@ -145,7 +145,8 @@ sigil exec implementer -- gh pr create ...
   --show-token`, etc.) are rejected before minting or execution. Child stdout
   and stderr are scrubbed of the raw bearer as defense in depth against
   accidental echo. Per-stream scrubbing is not a secrecy boundary against
-  adversarial code that can fragment or transform the bearer across streams.
+  adversarial code that can fragment or transform the bearer across streams;
+  adversarial child-output secrecy is explicitly out of scope for M1.
 - In legitimate use, the caller never receives the GitHub token.
 - Binary resolution ignores caller `PATH` and searches only trusted system
   directories (`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`).
@@ -168,8 +169,10 @@ sigil exec implementer -- gh pr create ...
   frames is blocked, but repo-local execution inherits `GH_TOKEN` in its
   environment and could exfiltrate via network or cross-stream fragmentation.
   Treat untrusted checkouts as residual risk until M2 constrains these vectors.
-  Inspect repo-local `.git/config` and `.gitattributes` before running against
-  untrusted workdirs, or run from outside the untrusted tree.
+  M2 must not inherit the M1 compatibility path unchanged if token secrecy is
+  still a security goal. Inspect repo-local `.git/config` and `.gitattributes`
+  before running against untrusted workdirs, or run from outside the untrusted
+  tree.
 - Dangerous `git` arguments are blocked, including `--upload-pack`,
   `--receive-pack`, `--exec`, `--exec-path`, `--template`, `--git-dir`,
   `--work-tree`, `--config-env`, `--config`, and `-C` (except for
