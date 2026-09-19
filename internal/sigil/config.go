@@ -11,12 +11,10 @@ import (
 	"strings"
 )
 
-const ReviewerClientID = "Iv23liYTtTwOvyDhpyK0"
-
 var roleNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
 
-// RoleConfig is deliberately role-neutral. Add implementer.json or tester.json
-// later without changing the authentication code.
+// RoleConfig is deliberately role-neutral. Every role binding must declare
+// its client_id explicitly; there are no role-specific defaults.
 type RoleConfig struct {
 	ClientID          string `json:"client_id"`
 	PrivateKeyPath    string `json:"private_key_path"`
@@ -59,9 +57,6 @@ func LoadRoleConfig(role string) (RoleConfig, string, error) {
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&config); err != nil {
 		return RoleConfig{}, path, fmt.Errorf("read config %s: %w", path, err)
-	}
-	if role == "reviewer" && config.ClientID == "" {
-		config.ClientID = ReviewerClientID
 	}
 	if config.ClientID == "" {
 		return RoleConfig{}, path, fmt.Errorf("config %s: client_id is required", path)

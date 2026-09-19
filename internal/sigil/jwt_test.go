@@ -22,7 +22,7 @@ func TestCreateAppJWT(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Unix(1_700_000_000, 0)
-	token, err := CreateAppJWT(ReviewerClientID, key, now)
+	token, err := CreateAppJWT("Iv23liYTtTwOvyDhpyK0", key, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,8 +53,8 @@ func TestCreateAppJWT(t *testing.T) {
 	if err := json.Unmarshal(decode(parts[1]), &claims); err != nil {
 		t.Fatal(err)
 	}
-	if claims.Issuer != ReviewerClientID {
-		t.Fatalf("issuer = %q, want %q", claims.Issuer, ReviewerClientID)
+	if claims.Issuer != "Iv23liYTtTwOvyDhpyK0" {
+		t.Fatalf("issuer = %q, want %q", claims.Issuer, "Iv23liYTtTwOvyDhpyK0")
 	}
 	if claims.IssuedAt != now.Add(-time.Minute).Unix() {
 		t.Fatalf("iat = %d", claims.IssuedAt)
