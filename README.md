@@ -112,7 +112,7 @@ otherwise. The CLI exits with the target command's exit code. If the daemon
 is down you get:
 
 ```text
-sigil: broker unavailable: start sigild or configure SIGIL_SOCKET
+sigil: broker unavailable: start sigild or configure SIGIL_ADMIN_SOCKET
 ```
 
 On the first run for a repository, `sigild` asks GitHub for the App
@@ -152,7 +152,15 @@ sigil exec implementer -- gh pr create ...
   are scrubbed before the broker credential is injected.
 - Every broker-spawned `git` runs with `-c core.hooksPath=/dev/null` ahead of
   caller arguments: repository-controlled hooks never execute inside the
-  broker tree.
+  broker tree. This is not complete repository-code isolation: repository-local
+  Git config (`.git/config`, `GIT_CONFIG_COUNT` via `-c`, attributes) is still
+  read, and aliases or helpers prefixed with `!` execute shell commands
+  (e.g. `git -c alias.status='!evil' status`, `core.pager`, `core.fsmonitor`,
+  `filter.*`, `diff.*.command`, `merge.*.driver`). Because the broker token is
+  in the `git` process environment, treat untrusted checkouts as residual risk
+  until M2 constrains these vectors. Inspect repo-local `.git/config` and
+  `.gitattributes` before running against untrusted workdirs, or run from
+  outside the untrusted tree.
 - Dangerous `git` arguments are blocked, including `--upload-pack`,
   `--receive-pack`, `--exec`, `--exec-path`, `--template`, `--git-dir`,
   `--work-tree`, `--config-env`, `--config`, and `-C` (except for
