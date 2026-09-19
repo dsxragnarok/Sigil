@@ -1,0 +1,5 @@
+{
+  "client_id": "REPLACE_WITH_IMPLEMENTER_APP_CLIENT_ID",
+  "private_key_path": "~/.config/sigil/implementer.private-key.pem",
+  "default_repository": "owner/repository"
+}
