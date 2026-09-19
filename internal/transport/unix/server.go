@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -90,6 +91,7 @@ func serveExec(w http.ResponseWriter, r *http.Request, exec Executor) {
 	go func() {
 		defer stdinWriter.Close()
 		var total int64
+		writeClosed := false
 		scanner := bufio.NewScanner(rest)
 		scanner.Buffer(make([]byte, 64*1024), MaxStreamFrameBytes+1024)
 		for scanner.Scan() {
@@ -118,7 +120,14 @@ func serveExec(w http.ResponseWriter, r *http.Request, exec Executor) {
 					_ = stdinWriter.CloseWithError(err)
 					return
 				}
+				if writeClosed {
+					continue
+				}
 				if _, err := stdinWriter.Write(data); err != nil {
+					if errors.Is(err, io.ErrClosedPipe) {
+						writeClosed = true
+						continue
+					}
 					scanErr <- err
 					return
 				}

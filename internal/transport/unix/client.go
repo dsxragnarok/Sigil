@@ -83,7 +83,7 @@ func (c *Client) Exec(ctx context.Context, meta Meta, stdin io.Reader, stdout, s
 
 	response, err := c.HTTP.Do(request)
 	if err != nil {
-		return 0, fmt.Errorf("sigil: broker unavailable: start sigild or configure SIGIL_SOCKET: %w", err)
+		return 0, fmt.Errorf("sigil: broker unavailable: start sigild or configure SIGIL_ADMIN_SOCKET: %w", err)
 	}
 	defer response.Body.Close()
 

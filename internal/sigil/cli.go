@@ -16,12 +16,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"sigil/internal/runtime"
 	utransport "sigil/internal/transport/unix"
 )
+
+var roleNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
 
 const usage = `Usage:
   sigil exec <role> [--repo owner/name] [--installation-id id] -- <gh|git> [args...]

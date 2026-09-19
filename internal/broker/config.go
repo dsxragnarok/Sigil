@@ -88,9 +88,9 @@ func loadRoleBinding(configDir, role string) (github.Binding, string, error) {
 	if file.PrivateKeyPath == "" {
 		return github.Binding{}, "", fmt.Errorf("config for role %q: private_key_path is required", role)
 	}
-	keyPath := file.PrivateKeyPath
-	if !filepath.IsAbs(keyPath) && !strings.HasPrefix(keyPath, "~/") {
-		keyPath = filepath.Join(configDir, keyPath)
+	keyPath, err := resolveBrokerKeyPath(configDir, file.PrivateKeyPath)
+	if err != nil {
+		return github.Binding{}, "", fmt.Errorf("config for role %q: %w", role, err)
 	}
 	return github.Binding{
 		Name:           role,
@@ -98,4 +98,21 @@ func loadRoleBinding(configDir, role string) (github.Binding, string, error) {
 		PrivateKeyRef:  "file:" + keyPath,
 		InstallationID: file.InstallationID,
 	}, file.DefaultRepository, nil
+}
+
+func resolveBrokerKeyPath(configDir, path string) (string, error) {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("expand private key path: %w", err)
+		}
+		if path == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, strings.TrimPrefix(path, "~/")), nil
+	}
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path), nil
+	}
+	return filepath.Join(configDir, path), nil
 }

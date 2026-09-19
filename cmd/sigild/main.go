@@ -13,7 +13,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -133,7 +132,6 @@ func run() error {
 	defer cancel()
 	_ = agentServer.Shutdown(shutCtx)
 	_ = adminServer.Shutdown(shutCtx)
-	_ = http.ErrServerClosed
 	return nil
 }
 
