@@ -147,7 +147,7 @@ sigil exec implementer -- gh pr create ...
   accidental echo. Per-stream scrubbing is not a secrecy boundary against
   adversarial code that can fragment or transform the bearer across streams;
   adversarial child-output secrecy is explicitly out of scope for M1.
-- In legitimate use, the caller never receives the GitHub token.
+- In legitimate use, the caller never receives the GitHub token directly from the broker.
 - Binary resolution ignores caller `PATH` and searches only trusted system
   directories (`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`).
   The child process runs with this sanitized `PATH`.
