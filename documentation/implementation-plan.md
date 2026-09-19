@@ -46,7 +46,13 @@ Current capabilities include:
 - process-local GitHub HTTPS credential helper;
 - tests around cache, config, JWT, GitHub client, CLI, and runner behavior.
 
-M0 remains the compatibility reference for all later milestones.
+Known M0 bootstrap artifacts that must not become architectural dependencies:
+
+- `config.go` contains a reviewer-specific fallback `ReviewerClientID`; M1 removes this fallback and requires every role config/provider binding to supply its identity explicitly;
+- `cli.go` reads `SIGIL_CONFIG_DIR` and `SIGIL_CACHE_DIR`, loads role config/private keys, and writes `installations.json`; in M1 the CLI becomes a dumb proxy and `sigild` alone owns those operations;
+- only `reviewer.example.json` existed at the start of this hardening pass; equivalent implementer and tester examples are added so the role-neutral claim is represented in the repository.
+
+M0 remains the behavioral compatibility reference for all later milestones, not the security model for untrusted same-user agents.
 
 ---
 
@@ -54,24 +60,24 @@ M0 remains the compatibility reference for all later milestones.
 
 ## Goal
 
-Move long-lived credentials and GitHub token minting out of the agent-facing CLI into a trusted broker process.
+Move long-lived credentials, role configuration, cache ownership, token minting, and compatibility command execution out of the agent-facing CLI into a trusted broker process.
 
 After M1:
 
 ```text
-agent
+trusted/admin caller
   -> sigil CLI
-  -> Unix socket
+  -> sigil-admin.sock
   -> sigild
-  -> load private key
+  -> load role config/private key
   -> mint GitHub credential
   -> run gh/git
-  -> return stdout/stderr/exit status
+  -> chunked stdout/stderr/exit stream
 ```
 
 The caller never receives the GitHub token.
 
-M1 may retain explicit role selection for compatibility. Trusted role-bound sessions are M2.
+M1 retains explicit role selection only as a **trusted/admin compatibility path**. It is not an agent role-isolation boundary. Untrusted agents use role-bound sessions beginning in M2.
 
 ## 1.1 Add `cmd/sigild`
 
@@ -84,21 +90,42 @@ cmd/sigild/main.go
 Responsibilities:
 
 - start the local broker;
-- create/listen on a Unix-domain socket;
-- ensure safe socket permissions;
-- initialize config, provider, runner, and broker dependencies;
+- create/listen on Unix-domain sockets;
+- set `umask 0077` before creating runtime directories, sockets, lock files, temporary homes, or other broker-owned files;
+- enforce single-instance broker ownership;
+- safely clean stale sockets;
+- initialize config, provider, runner, broker, and audit dependencies;
 - handle clean shutdown;
 - surface startup errors clearly.
 
-Default socket target:
+Runtime paths:
 
 ```text
-$XDG_RUNTIME_DIR/sigil/sigil.sock
+Linux / XDG:
+  $XDG_RUNTIME_DIR/sigil/sigil.sock
+  $XDG_RUNTIME_DIR/sigil/sigil-admin.sock
+  $XDG_RUNTIME_DIR/sigil/sigild.lock
+
+macOS fallback:
+  ~/.local/state/sigil/sigil.sock
+  ~/.local/state/sigil/sigil-admin.sock
+  ~/.local/state/sigil/sigild.lock
 ```
 
-with a safe fallback when `XDG_RUNTIME_DIR` is unavailable, for example an owner-only directory under the user's home or platform-appropriate runtime location.
+Do not use `~/.local/run` as the fallback.
 
-The socket directory and socket must not be writable by other users.
+### Single-instance and stale-socket rules
+
+1. create/open the runtime directory under `umask 0077`;
+2. acquire a non-blocking exclusive `flock` on `sigild.lock`;
+3. if the lock cannot be acquired, fail with `sigild already running` rather than deleting sockets;
+4. only after the lock is held, inspect existing socket paths;
+5. if a socket accepts a connection or otherwise appears live, fail rather than replacing it;
+6. if it is stale, unlink it and create a new socket;
+7. hold the lock for the lifetime of the daemon;
+8. unlink owned socket paths on graceful shutdown.
+
+Default same-user mode keeps the runtime directory owner-only. Hard-isolation deployments may use explicit group/ACL rules for `sigil.sock` while keeping `sigil-admin.sock` launcher-only.
 
 ## 1.2 Add local transport package
 
@@ -108,34 +135,88 @@ Target package:
 internal/transport/unix/
 ```
 
-Use HTTP+JSON over a Unix socket.
+Use HTTP over Unix sockets with **chunked streaming from the first M1 implementation**. Do not build a temporary buffered JSON execution protocol.
 
-Initial endpoint:
+M1 admin endpoint:
 
 ```text
-POST /v1/exec
+POST /v1/exec    # sigil-admin.sock only; explicit role allowed
 ```
 
-Initial request shape:
+The ordinary agent socket is reserved for session-bound execution beginning in M2. It may expose `/v1/health` in M1, but must not accept arbitrary role-selecting execution.
+
+### Framing
+
+Use `Transfer-Encoding: chunked` and newline-delimited JSON frames (`application/x-ndjson`). Binary stream data is base64 encoded in frames.
+
+Initial request frames:
 
 ```json
-{
-  "role": "reviewer",
-  "repository": "dsxragnarok/council",
-  "installation_id": 0,
-  "command": ["gh", "pr", "view", "1"]
-}
+{"type":"meta","role":"reviewer","repository":"dsxragnarok/council","installation_id":0,"working_dir":"/work/council","command":["gh","pr","view","1"],"timeout_seconds":120}
+{"type":"stdin","data":"<base64 bytes>"}
+{"type":"stdin_eof"}
 ```
 
-Initial response model should support:
+Initial response frames:
 
-- process exit code;
-- broker-level error;
-- stdout/stderr streaming or bounded capture.
+```json
+{"type":"stdout","data":"<base64 bytes>"}
+{"type":"stderr","data":"<base64 bytes>"}
+{"type":"exit","code":0}
+```
 
-Prefer streaming if implementation complexity remains reasonable. If M1 uses buffered output first, enforce explicit output limits and document them.
+Stream requirements:
 
-Do not include provider credentials in transport messages.
+- stdin is forwarded incrementally to the child process;
+- stdout and stderr remain distinct;
+- preserve frame order as emitted by each stream, without claiming a total ordering between stdout and stderr;
+- the final success-path frame is exactly one `exit` frame;
+- credentials never appear in any frame.
+
+### Request and stream bounds
+
+Initial defaults:
+
+```text
+max command arguments              256
+max aggregate argument bytes       64 KiB
+max metadata frame                 64 KiB
+max individual stream frame        1 MiB
+max stdin per execution            64 MiB
+max stdout+stderr per execution    64 MiB
+default execution timeout          120 s
+termination grace period           5 s
+```
+
+Limits should be constants/configurable broker policy, not client-controlled expansion knobs.
+
+`working_dir` requirements:
+
+- required for repository-sensitive `git` execution;
+- must be absolute;
+- canonicalize with symlink resolution before execution;
+- must exist and be a directory;
+- must fall under a broker/session-approved workspace root;
+- reject paths that cannot be resolved safely.
+
+### Timeout and process-tree termination
+
+The runner starts `gh`/`git` in a separate process group. On timeout, client cancellation, or broker cancellation:
+
+1. send `SIGTERM` to the process group;
+2. wait the grace period (default 5 seconds);
+3. send `SIGKILL` to the process group if any process remains;
+4. return the appropriate broker/exit result without leaking credentials.
+
+### Error model
+
+Distinguish transport/broker failure from target-command failure:
+
+- malformed request, authentication/authority failure, invalid working directory, provider failure, or inability to start the child -> non-2xx HTTP response;
+- unexpected broker failure -> 5xx HTTP response;
+- `gh` or `git` starts successfully but exits non-zero -> HTTP `200 OK` with final `{"type":"exit","code":N}` frame.
+
+Do not convert an ordinary target exit code into a 5xx broker failure.
 
 ## 1.3 Extract broker orchestration
 
@@ -145,16 +226,18 @@ Create:
 internal/broker/
 ```
 
-Move the orchestration currently performed by the CLI into a broker service.
+Move orchestration currently performed by `internal/sigil/cli.go` into a broker service.
 
 Conceptual API:
 
 ```go
 type ExecRequest struct {
-    Role           string
+    Role           string // M1 admin path only; removed from agent request in M2
     Repository     string
     InstallationID int64
+    WorkingDir     string
     Command        []string
+    Timeout        time.Duration
 }
 
 type Broker interface {
@@ -164,13 +247,25 @@ type Broker interface {
 
 Broker flow:
 
-1. validate request;
-2. load role/provider binding;
-3. resolve repository scope;
-4. obtain provider credential;
-5. invoke hardened runner;
-6. return process result;
-7. zero/drop credential references as soon as practical.
+1. validate transport authority and request;
+2. validate/canonicalize working directory;
+3. load role/provider binding from broker-owned configuration;
+4. resolve repository scope;
+5. obtain provider credential;
+6. invoke hardened runner;
+7. stream process result;
+8. zero/drop credential references as soon as practical.
+
+### Config/cache ownership
+
+M1 makes ownership explicit:
+
+- `sigild` alone loads role/provider config;
+- `sigild` alone reads private-key references;
+- `sigild` alone reads/writes installation cache state;
+- the CLI does not read `SIGIL_CONFIG_DIR` or `SIGIL_CACHE_DIR`;
+- client-supplied environment cannot redirect broker config/cache paths;
+- broker config/cache locations are fixed at daemon startup.
 
 ## 1.4 Extract GitHub provider
 
@@ -195,9 +290,7 @@ Preserve current behavior and tests from:
 - `jwt.go`;
 - GitHub-related cache behavior.
 
-Introduce a provider abstraction only as far as M1 needs it. Avoid speculative complexity.
-
-Suggested high-level interface:
+M1 provider contract is credential-oriented and must match the architecture:
 
 ```go
 type CredentialRequest struct {
@@ -209,7 +302,15 @@ type Credential struct {
     Token     string
     ExpiresAt time.Time
 }
+
+type Provider interface {
+    Name() string
+    ResolveIdentity(ctx context.Context, binding Binding) (Identity, error)
+    Prepare(ctx context.Context, req CredentialRequest) (Credential, error)
+}
 ```
+
+Do **not** introduce `Operation` into the provider interface in M1. Transition to operation-oriented requests in M4 when native operations exist.
 
 The token must remain broker-local.
 
@@ -235,11 +336,15 @@ Initial implementation:
 file:
 ```
 
-Migrate private-key loading behind this interface while preserving the current permission checks.
+Migrate private-key loading behind this interface while preserving current permission checks.
+
+Remove the reviewer-specific Client ID fallback during this extraction. Every identity must declare its Client ID/config explicitly.
 
 M1 does not need macOS Keychain support yet.
 
-## 1.6 Preserve runner hardening
+Security wording must remain precise: moving key loading to `sigild` means the **architecture** no longer hands keys to the CLI. Same-UID file permissions do not prevent an unrestricted same-user agent from opening those key files itself. Enforced key secrecy requires the hard-isolation deployment in `architecture.md` §10.2.
+
+## 1.6 Preserve and strengthen runner hardening
 
 Move or retain existing `runner.go` behavior behind:
 
@@ -247,7 +352,7 @@ Move or retain existing `runner.go` behavior behind:
 internal/runner/
 ```
 
-Do not weaken existing controls.
+**Locked execution model: `sigild` spawns remote `git` directly.** Do not add an agent-facing credential-helper architecture.
 
 Regression requirements:
 
@@ -259,30 +364,104 @@ Regression requirements:
 - global/system Git config suppressed;
 - SSH config pinned;
 - pagers/editors neutralized;
-- process-local credential helper preserved;
 - no credential in argv;
 - no credential written to disk;
 - repository-scoped installation token retained where possible.
 
-The key M1 difference is that the runner executes inside `sigild`, not inside the agent-facing CLI.
+New M1 requirements:
 
-## 1.7 Convert `sigil exec` into a client
+### GitHub CLI/personal identity isolation
 
-Current:
+For every broker-spawned `gh` or `git` process:
+
+- create a fresh broker-owned temporary execution home under `umask 0077`;
+- set `HOME` to that temporary home where compatible;
+- set `GH_CONFIG_DIR` to a fresh empty broker-owned directory within it;
+- remove `GH_HOST`;
+- remove caller `GH_TOKEN`;
+- remove caller `GITHUB_TOKEN`;
+- remove `GH_ENTERPRISE_TOKEN`;
+- remove every environment variable matching `GITHUB_*_TOKEN`;
+- remove `SSH_AUTH_SOCK`;
+- inject only the broker-minted credential needed by the child;
+- delete temporary execution state after the child exits.
+
+This prevents `gh` from reading `~/.config/gh/hosts.yml` and silently falling back to a human OAuth token if App authentication fails.
+
+### Git hook suppression
+
+For every broker-spawned Git command, inject:
+
+```text
+git -c core.hooksPath=/dev/null ...
+```
+
+before caller-controlled Git arguments.
+
+This is mandatory even if the repository is trusted. Repository-controlled hooks must never execute inside the `sigild` process tree.
+
+The review proposed also injecting a global `--no-hooks` Git flag. Current Git does not define such a global option, so M1 must not emit it unconditionally. The supported all-hooks control is `core.hooksPath=/dev/null`. Command-specific documented no-hook/no-verify flags may be added as defense in depth where applicable.
+
+### Working-directory isolation
+
+The runner must receive an already validated canonical `working_dir` from the broker and set `cmd.Dir` explicitly. It must never inherit the daemon's current working directory or accept Git `-C`, `--git-dir`, or `--work-tree` as an alternate path escape.
+
+### Process lifecycle
+
+- create a separate process group;
+- enforce the broker timeout;
+- kill the process tree using `SIGTERM` -> grace -> `SIGKILL`;
+- close stdin on `stdin_eof`;
+- stop streaming after the final exit/error condition.
+
+### Required tests
+
+Add explicit regression tests proving:
+
+- `GH_CONFIG_DIR` is fresh and empty;
+- inherited `HOME` is not used for GitHub CLI credentials;
+- `GH_HOST`, `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, and `GITHUB_*_TOKEN` values are scrubbed;
+- `SSH_AUTH_SOCK` is absent;
+- `-c core.hooksPath=/dev/null` is injected ahead of caller Git arguments;
+- a malicious `.git/hooks/pre-push` or equivalent fixture does not execute;
+- `working_dir` outside allowed roots is denied;
+- symlink escape from an allowed root is denied after canonicalization;
+- timed-out grandchildren are terminated, not orphaned;
+- no credential appears in argv, temp files, stdout/stderr, or error strings.
+
+## 1.7 Convert `sigil exec` into a dumb client
+
+M1 trusted/admin behavior:
 
 ```bash
 sigil exec reviewer -- gh ...
 ```
 
-M1 behavior should remain user-compatible where practical, but the CLI sends the request to `sigild` rather than loading keys or minting credentials itself.
+The CLI:
 
-`sigil` should no longer require read access to GitHub App private keys.
+- parses user-facing arguments;
+- connects to `sigil-admin.sock`;
+- sends metadata/stream frames;
+- streams stdin;
+- renders stdout/stderr;
+- exits with the target exit code when an `exit` frame is received.
+
+The CLI must not:
+
+- load role config;
+- read private keys;
+- mint JWTs/tokens;
+- discover installations;
+- read/write `installations.json`;
+- honor `SIGIL_CONFIG_DIR` or `SIGIL_CACHE_DIR` as client overrides.
 
 Provide a clear error if the broker is unavailable:
 
 ```text
 sigil: broker unavailable: start sigild or configure SIGIL_SOCKET
 ```
+
+For admin commands, use `SIGIL_ADMIN_SOCKET` only in trusted launcher environments. Do not export it into agent environments.
 
 ## 1.8 Broker startup strategy
 
@@ -291,39 +470,49 @@ M1 may support either:
 - explicitly running `sigild`; or
 - optional `sigil daemon start` / `sigil daemon stop` commands.
 
-Do not auto-spawn a privileged broker invisibly in the first implementation unless lifecycle behavior is well defined.
+Do not auto-spawn the broker invisibly in the first implementation unless lifecycle, lock ownership, socket cleanup, and shutdown behavior are defined and tested.
 
 ## 1.9 M1 testing
 
-Add tests for:
-
 ### Unit tests
 
-- Unix socket path validation;
-- socket permission validation;
-- transport request validation;
+Add tests for:
+
+- runtime path selection including macOS fallback;
+- `umask`/permission expectations where testable;
+- single-instance lock behavior;
+- stale socket cleanup only after lock acquisition;
+- refusal to replace a live socket;
+- chunked frame parsing/encoding;
+- argument, metadata, stream, and payload limits;
+- working-directory validation/canonicalization;
 - broker request validation;
 - provider credential acquisition;
 - secret store path/permission rules;
-- runner regression suite;
+- runner hardening and environment isolation;
+- timeout/process-group termination;
 - errors never include token/private-key content.
 
 ### Integration tests
 
-Use a fake provider and fake runner to verify:
+Use a fake provider and controlled test runner to verify:
 
 ```text
-sigil CLI -> Unix socket -> sigild -> provider -> runner
+sigil CLI -> sigil-admin.sock -> sigild -> provider -> runner
 ```
 
 Verify that:
 
 - client process never receives provider token;
-- token does not appear in request/response body;
+- token does not appear in request/response frames;
 - role config is resolved only by broker;
-- stdout/stderr/exit status propagate correctly;
-- broker rejects malformed command requests;
-- socket rejects access from inappropriate filesystem permissions where testable.
+- client `SIGIL_CONFIG_DIR` / `SIGIL_CACHE_DIR` cannot redirect daemon state;
+- streamed stdin reaches the child;
+- stdout/stderr frames propagate incrementally;
+- target non-zero exit is HTTP 200 + non-zero exit frame;
+- broker/internal failure uses non-2xx/5xx as appropriate;
+- malformed frames and limit violations fail closed;
+- hook suppression and GH config isolation are active in the real runner path.
 
 ### Live GitHub smoke test
 
@@ -333,22 +522,31 @@ Optional/manual test using `dsxreviewer`:
 sigil exec reviewer -- gh pr view 1 -R dsxragnarok/council
 ```
 
-Then post or read a harmless PR operation and verify attribution remains `dsxreviewer[bot]`.
+Then perform a harmless PR operation and verify attribution remains `dsxreviewer[bot]`.
 
 ## 1.10 M1 acceptance criteria
 
 M1 is complete when all of the following are true:
 
-- `sigild` exists and listens on an owner-only Unix socket;
-- `sigil exec` talks to `sigild` instead of loading keys itself;
-- only `sigild` needs read access to GitHub App private keys;
+- `sigild` owns its runtime directory under `umask 0077`;
+- single-instance lock and stale-socket handling are tested;
+- `sigil-admin.sock` exists for trusted explicit-role execution;
+- agent socket does not expose arbitrary role-selecting execution;
+- `sigil exec <role>` talks to `sigild` instead of loading keys itself;
+- only `sigild` code loads GitHub App private keys/config/cache state;
+- documentation explicitly states same-UID processes may still read broker files unless OS isolation prevents it;
 - GitHub installation tokens are minted only inside `sigild`;
 - tokens are not returned to `sigil` or written to disk;
-- existing `gh` and `git` functionality still works;
-- existing runner hardening remains covered by tests;
-- current reviewer/implementer/tester role configuration remains usable;
+- HTTP execution is chunked and supports streamed stdin/stdout/stderr;
+- target exit codes are distinct from broker transport errors;
+- default 120-second timeout kills the whole child process tree;
+- `GH_CONFIG_DIR`/temporary `HOME` prevent fallback to personal GitHub CLI state;
+- personal token environment is scrubbed;
+- broker-spawned Git always disables repository hooks with `core.hooksPath=/dev/null`;
+- validated `working_dir` cannot escape approved workspace roots;
+- reviewer/implementer/tester configs are explicit and role-neutral;
 - all automated tests pass;
-- README/documentation is updated for broker startup and usage.
+- README/documentation is updated for broker startup and trusted/admin usage.
 
 ---
 
@@ -356,7 +554,7 @@ M1 is complete when all of the following are true:
 
 ## Goal
 
-Remove role selection from the untrusted agent.
+Remove role selection from the untrusted agent and separate launcher authority from agent execution authority.
 
 Trusted launcher:
 
@@ -371,7 +569,7 @@ Agent environment:
 
 ```text
 SIGIL_SESSION=<opaque-id>
-SIGIL_SOCKET=<socket-path>
+SIGIL_SOCKET=<agent-socket-path>
 ```
 
 Agent command:
@@ -380,7 +578,7 @@ Agent command:
 sigil exec -- gh pr view 42
 ```
 
-There is no agent-controlled role flag.
+There is no agent-controlled role flag, no admin socket path, and no session-creation credential in the agent environment.
 
 ## 2.1 Session manager
 
@@ -390,49 +588,107 @@ Create:
 internal/session/
 ```
 
+Initial storage:
+
+```text
+in-memory map[string]Session behind sync.RWMutex / sync.Mutex
+```
+
+No persistence in M2. Daemon restart invalidates every session.
+
+Session ID generation:
+
+```go
+raw := make([]byte, 32)
+_, err := crypto_rand.Read(raw)
+id := hex.EncodeToString(raw) // 64 hex chars
+```
+
 Session fields:
 
-- cryptographically random opaque ID;
+- 32-byte cryptographically random opaque ID, hex encoded;
 - role;
 - creation time;
 - expiration time;
 - repository scope;
 - provider scope;
-- revocation status.
+- revocation state;
+- approved workspace roots if needed by execution policy.
+
+TTL rules:
+
+- default TTL: 1 hour;
+- broker chooses timestamps; client does not submit absolute creation/expiry times;
+- requested TTL may only reduce authority unless an explicit broker maximum permits more;
+- use the broker's in-process monotonic time component for expiry decisions so wall-clock rollback cannot extend a live session;
+- expiry comparison ambiguity fails closed.
 
 Session rules:
 
 - role cannot be changed after creation;
-- repository scope cannot be widened;
+- repository/provider/workspace scope cannot be widened;
 - expired sessions fail closed;
 - revoked sessions fail closed;
-- unknown sessions fail closed.
+- unknown sessions fail closed;
+- lookup and revocation are synchronized so a revoked session cannot race back into valid state;
+- revocation is fail-closed: once revocation is requested/recorded, no new operation may start under that session.
 
-## 2.2 Add session endpoints
+## 2.2 Launcher-authenticated session endpoints
 
-Likely endpoints:
+Authority separation is explicit from M1 onward.
+
+Admin socket only:
 
 ```text
-POST /v1/sessions
-GET  /v1/sessions/{id}
+POST   /v1/sessions
+GET    /v1/sessions/{id}
 DELETE /v1/sessions/{id}
+```
+
+Agent socket:
+
+```text
 POST /v1/exec
 ```
 
-`POST /v1/exec` accepts session ID rather than role.
+`POST /v1/exec` accepts a session ID, not a role.
+
+### Launcher authentication mechanism
+
+M2 uses **socket separation as the local launcher authority mechanism**:
+
+- `sigil-admin.sock` accepts session creation/revocation and trusted explicit-role compatibility operations;
+- `sigil.sock` accepts session-bound agent execution only;
+- `sigil run` connects to the admin socket before spawning the agent;
+- the spawned agent receives only `SIGIL_SOCKET` and `SIGIL_SESSION`;
+- `SIGIL_ADMIN_SOCKET` is never inherited by the agent;
+- session endpoints are not registered on `sigil.sock`.
+
+Security boundary statement:
+
+- in same-user unsandboxed mode, socket separation prevents accidental/API misuse but does not stop an actively hostile process with the same UID from discovering the admin socket;
+- hard role/session isolation requires the deployment boundary from `architecture.md` §10.2, where the admin socket is not reachable from the agent identity/container/VM;
+- do not claim owner-only `0700`/`0600` permissions distinguish two processes running under the same UID.
+
+This is a deliberate design decision, not an unresolved TODO.
 
 ## 2.3 Implement `sigil run`
 
 `sigil run` should:
 
-1. request a session from the broker;
-2. construct a sanitized child environment;
-3. set `SIGIL_SESSION` and `SIGIL_SOCKET`;
-4. remove personal GitHub token variables;
-5. isolate GitHub CLI configuration where practical;
-6. optionally remove `SSH_AUTH_SOCK`;
-7. launch the requested agent command;
-8. revoke/end the session when the process exits unless configured otherwise.
+1. operate as a trusted launcher command;
+2. connect to `sigil-admin.sock`;
+3. request a session for the selected role/repository/workspace scope;
+4. construct a sanitized child environment;
+5. set only `SIGIL_SESSION` and `SIGIL_SOCKET` for Sigil authority;
+6. ensure `SIGIL_ADMIN_SOCKET` is absent;
+7. remove personal GitHub token variables;
+8. remove or replace personal GitHub CLI configuration where the agent environment is intended to be isolated;
+9. optionally remove `SSH_AUTH_SOCK` based on the deployment profile;
+10. launch the requested agent command;
+11. revoke/end the session when the process exits unless explicitly configured otherwise.
+
+`sigil run` does not pass the provider token, role config, App private key, or admin authority into the child.
 
 ## 2.4 Compatibility migration
 
@@ -442,20 +698,47 @@ Human/trusted use may temporarily retain:
 sigil exec reviewer -- ...
 ```
 
-but agent-facing documentation and orchestrator integration should use role-bound sessions.
+but it uses `sigil-admin.sock` and is documented as trusted/admin-only.
 
-Eventually explicit-role `exec` can become an administrative/trusted-only compatibility command or be removed.
+Agent-facing documentation and orchestrator integration use role-bound sessions exclusively:
 
-## 2.5 M2 acceptance criteria
+```bash
+sigil exec -- ...
+```
 
-- Council/Pi/human can launch a role-bound agent session;
+Eventually explicit-role `exec` can be removed or retained only as an administrative command.
+
+## 2.5 M2 testing
+
+Add tests proving:
+
+- session IDs are exactly 32 random bytes encoded as 64 hex characters;
+- no predictable/colliding test RNG is used in production path;
+- concurrent lookup/revoke is race-safe;
+- daemon restart invalidates sessions;
+- default TTL is 1 hour;
+- broker time, not client timestamps, controls expiry;
+- monotonic TTL is not extended by wall-clock rollback in testable clock abstraction;
+- expired/revoked/unknown sessions fail closed;
+- `POST /v1/sessions` does not exist on the agent socket;
+- agent-side `/v1/exec` rejects a role field;
+- session scope cannot be widened by exec metadata;
+- `sigil run` does not expose `SIGIL_ADMIN_SOCKET`;
+- hard-isolation integration fixture cannot reach the admin socket from the agent boundary where platform CI permits.
+
+## 2.6 M2 acceptance criteria
+
+- Council/Pi/human can launch a role-bound agent session through the admin socket;
 - agent can call `sigil exec -- ...` with no role argument;
-- agent cannot request another role through the session API;
+- agent socket cannot create, mutate, or revoke sessions;
+- agent cannot request another role through exec metadata;
 - repository-bound session cannot operate against another repository;
+- workspace-bound session cannot escape approved working roots;
 - expired/revoked session is denied;
-- role private keys remain broker-only;
+- broker restart invalidates existing sessions;
+- role private keys remain broker-side architecturally, with hard filesystem enforcement documented as a separate-user/container requirement;
 - environment strips personal GitHub token variables;
-- tests prove role and scope are immutable from the agent side.
+- tests prove role and scope are immutable from the agent API.
 
 ---
 
@@ -463,7 +746,7 @@ Eventually explicit-role `exec` can become an administrative/trusted-only compat
 
 ## Goal
 
-Add Sigil-native authorization on top of provider-native permissions.
+Add Sigil-native authorization on top of provider-native permissions and make delegated operations auditable by default.
 
 ## 3.1 Policy package
 
@@ -518,7 +801,7 @@ capabilities = [
 ]
 ```
 
-Migration should support existing JSON configs until the new format is stable.
+Migration may support existing JSON configs until the new format is stable, but there must be no role-specific hardcoded identity defaults.
 
 ## 3.3 Structured audit
 
@@ -527,6 +810,27 @@ Create:
 ```text
 internal/audit/
 ```
+
+Default audit path:
+
+```text
+$XDG_STATE_HOME/sigil/audit.jsonl
+```
+
+fallback:
+
+```text
+~/.local/state/sigil/audit.jsonl
+```
+
+Requirements:
+
+- broker-owned;
+- containing directory mode `0700` by default;
+- file mode `0600`;
+- opened append-only;
+- JSONL;
+- fail closed when audit is unavailable.
 
 Record:
 
@@ -541,18 +845,41 @@ Record:
 - duration;
 - process exit status where relevant.
 
-Never record tokens, JWTs, private keys, or authorization headers.
+Never record tokens, JWTs, private keys, authorization headers, or raw secret-store values.
+
+Fail-closed behavior:
+
+- before a consequential delegated operation, append/sync an attempt record;
+- if that write fails, deny the operation;
+- append the completion/result record after execution;
+- if completion logging fails after the target already executed, surface the audit failure and stop accepting further delegated operations until audit health is restored.
 
 ## 3.4 Compatibility-command policy
 
-For `sigil exec -- gh ...`, begin with coarse policy categories where reliable classification is possible.
+For `sigil exec -- gh ...`, begin with coarse policy categories only where classification is reliable.
 
-Do not pretend arbitrary `gh api` is strongly typed authorization.
+Reviewer role must explicitly blacklist these high-risk top-level `gh` command families in compatibility mode:
 
-Unknown/unclassifiable high-risk commands should either:
+```text
+gh auth
+gh secret
+gh api
+gh workflow
+gh run
+gh cache
+gh extension
+```
 
-- be denied for restricted roles; or
-- remain explicitly documented as compatibility-mode residual risk.
+Rationale:
+
+- `auth` can mutate or expose authentication state;
+- `secret` manages repository/environment/organization secrets;
+- `api` bypasses typed intent classification;
+- `workflow` / `run` can trigger or manipulate automation with broader effects;
+- `cache` mutates Actions cache state;
+- `extension` introduces arbitrary external command execution.
+
+The blacklist is defense in depth, not a substitute for native typed operations. Unknown/unclassifiable high-risk compatibility commands should fail closed for restricted roles.
 
 ## 3.5 M3 acceptance criteria
 
@@ -561,10 +888,13 @@ Unknown/unclassifiable high-risk commands should either:
 - repository scope enforced by Sigil independently of GitHub;
 - explicit deny works;
 - structured audit record emitted for every broker operation;
+- audit file ownership/mode/path is enforced;
+- delegated writes fail closed when audit is unavailable;
 - secrets never appear in audit output;
+- reviewer compatibility path denies `auth`, `secret`, `api`, `workflow`, `run`, `cache`, and `extension`;
 - reviewer cannot use Sigil policy path to perform repository-write or merge capability;
 - tester cannot gain implementer capability;
-- automated tests cover allow, deny, scope violation, expiry, and audit redaction.
+- automated tests cover allow, deny, scope violation, expiry, blacklist behavior, audit failure, and audit redaction.
 
 ---
 
@@ -576,7 +906,7 @@ Reduce dependence on arbitrary `gh` command interpretation by introducing typed 
 
 ## 4.1 Operation model
 
-Introduce:
+Introduce the `Operation` abstraction here, not in M1:
 
 ```go
 type Operation struct {
@@ -586,6 +916,8 @@ type Operation struct {
     Parameters any
 }
 ```
+
+Provider preparation may now evolve from `CredentialRequest{Identity, Repository}` to an operation-aware contract where needed. Preserve compatibility adapters during the transition.
 
 Initial native GitHub operations should focus on existing role workflows:
 
@@ -775,14 +1107,16 @@ Existing runner security tests are especially important and should remain regres
 
 ## Fail closed
 
-Authentication, session, provider, policy, and scope ambiguity should fail closed.
+Authentication, launcher authority, session, provider, policy, scope, audit availability, path validation, and transport ambiguity should fail closed.
 
 Do not silently fall back to:
 
 - the user's personal GitHub CLI credentials;
 - SSH agent credentials;
 - a broader installation token;
-- a default stronger role.
+- a default stronger role;
+- an unvalidated working directory;
+- an unaudited delegated operation.
 
 ## Keep provider credentials out of logs and IPC
 
@@ -799,17 +1133,27 @@ Never serialize or log:
 1. Provider identity permissions should be minimal.
 2. Sigil capabilities should be narrower or equal to provider permissions.
 
+## Separate same-user convenience from hard isolation
+
+Tests and documentation must use precise language:
+
+- same-UID workstation mode prevents accidental credential fallback and API misuse;
+- it does not make a secret file unreadable to another process with that UID;
+- hard isolation requires an OS/container/VM boundary and restricted admin-socket reachability.
+
 ## Avoid premature remote complexity
 
 M1-M4 should optimize for a correct local trust model.
 
 Remote and MCP support comes only after:
 
-- broker ownership of secrets;
+- broker ownership of config/cache/secrets;
+- daemon lifecycle hygiene;
+- launcher/admin authority separation;
 - immutable role sessions;
-- repository scoping;
+- repository/workspace scoping;
 - capability policy;
-- auditability;
+- fail-closed auditability;
 - typed provider operations.
 
 ---
@@ -818,17 +1162,20 @@ Remote and MCP support comes only after:
 
 The next implementation target is **M1**.
 
-Recommended first sequence:
+Recommended sequence:
 
-1. create `cmd/sigild`;
-2. create Unix socket transport with a fake broker;
-3. extract current orchestration from `internal/sigil/cli.go` into `internal/broker`;
-4. move GitHub authentication into `internal/provider/github` without changing behavior;
-5. move runner behind `internal/runner` while retaining all existing tests;
-6. move private-key loading behind `internal/secret`;
-7. convert `sigil exec` into a Unix-socket client;
-8. add integration tests proving credentials stay broker-side;
-9. run a live `dsxreviewer` smoke test against `dsxragnarok/council`;
-10. update README and freeze M1 behavior before starting sessions.
+1. add runtime-path helper with XDG/macOS fallback and `umask 0077`;
+2. add single-instance `flock` and safe stale-socket cleanup;
+3. create `cmd/sigild` with `sigil.sock` + `sigil-admin.sock` lifecycle;
+4. implement chunked NDJSON transport with streamed stdin/stdout/stderr, limits, and explicit error semantics using a fake broker;
+5. extract current orchestration from `internal/sigil/cli.go` into `internal/broker`, moving config/cache ownership into the daemon;
+6. move GitHub authentication into `internal/provider/github` using `CredentialRequest{Identity, Repository}`;
+7. move private-key loading behind `internal/secret` and remove `ReviewerClientID` fallback;
+8. move runner behind `internal/runner`, adding temporary `HOME`/`GH_CONFIG_DIR`, token env scrubbing, validated `working_dir`, process groups/timeouts, and mandatory `core.hooksPath=/dev/null`;
+9. convert `sigil exec <role>` into an admin-socket streaming client with no config/cache/key access;
+10. add integration tests proving credentials, personal `gh` state, repository hooks, and process descendants cannot escape the broker controls being claimed;
+11. add/verify reviewer, implementer, and tester example configs;
+12. run a live `dsxreviewer` smoke test against `dsxragnarok/council`;
+13. update README and freeze M1 before starting the M2 session engine.
 
-M1 should be kept deliberately narrow: **separate the trust boundary first; add role-bound authority in M2.**
+M1 should remain deliberately narrow: **establish the daemon trust boundary and execution hygiene first. M2 then binds agents to immutable role authority.**
