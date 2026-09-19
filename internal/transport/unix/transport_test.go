@@ -360,7 +360,6 @@ func TestImmediateExitWithBlockingStdin(t *testing.T) {
 	client := &Client{HTTP: server.Client(), URL: server.URL + "/v1/exec", StdinChunk: 4}
 
 	pr, pw := io.Pipe()
-	defer func() { _ = pw.Close() }()
 	type outcome struct {
 		code int
 		err  error
@@ -374,12 +373,24 @@ func TestImmediateExitWithBlockingStdin(t *testing.T) {
 	select {
 	case res := <-done:
 		if res.err != nil {
+			_ = pw.Close()
+			_ = pr.Close()
 			t.Fatalf("blocking stdin turned success into error: %v", res.err)
 		}
 		if res.code != 0 {
+			_ = pw.Close()
+			_ = pr.Close()
 			t.Fatalf("code = %d, want 0", res.code)
 		}
+		// Exec returned without requiring stdin EOF (deterministic
+		// lifecycle). Close the blocking stdin promptly so the request-upload
+		// goroutine (still blocked in stdin.Read) can exit; for one-shot CLI
+		// process exit reaps it, for reuse the caller must close.
+		_ = pw.Close()
+		_ = pr.Close()
 	case <-time.After(3 * time.Second):
+		_ = pw.Close()
+		_ = pr.Close()
 		t.Fatal("server waited for terminal stdin EOF (must return without EOF)")
 	}
 }

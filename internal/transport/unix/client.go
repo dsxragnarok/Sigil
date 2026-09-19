@@ -31,12 +31,26 @@ func NewClient(socketPath, endpoint string) *Client {
 // the target exit code from the single terminal exit frame. Broker failures
 // (non-2xx or error frames) are returned as errors, distinct from target
 // non-zero exits.
+//
+// Lifecycle: the server defines target exit as terminating request input,
+// so Exec returns without requiring stdin EOF (terminal stdin never closes).
+// The request-upload goroutine may still be blocked in stdin.Read after the
+// response finishes; it exits when stdin unblocks (EOF/close) and its next
+// Write fails on the closed body. For one-shot CLI use this is invisible
+// (process exit reaps it); for reuse close a blocking stdin promptly after
+// Exec returns so the upload goroutine does not linger.
 func (c *Client) Exec(ctx context.Context, meta Meta, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	metaLine, err := EncodeMeta(meta)
 	if err != nil {
 		return 0, err
 	}
 	bodyReader, bodyWriter := io.Pipe()
+	// Closing the body on return frees the HTTP connection promptly even
+	// while the upload goroutine is still blocked in stdin.Read. Its next
+	// Write then fails fast instead of blocking forever on a transport that
+	// stopped reading. The blocked Read itself unblocks only when stdin
+	// provides data/EOF or is closed by the caller.
+	defer func() { _ = bodyWriter.CloseWithError(context.Canceled) }()
 	go func() {
 		_, werr := bodyWriter.Write(metaLine)
 		if werr != nil {

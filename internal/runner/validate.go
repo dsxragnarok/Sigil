@@ -16,6 +16,44 @@ import (
 // --config) are blocked. -C is blocked everywhere except git commit -C
 // <commit> (which reuses commit messages). -u is blocked pre-subcommand and
 // for git clone (where it specifies upload-pack).
+// ValidateGhArguments rejects token-revealing compatibility commands.
+// All `gh auth` subcommands are denied: `gh auth token` prints the active
+// token and `gh auth status --show-token` does the same. Blocking the whole
+// family is intentional — no legitimate broker execution needs to mutate or
+// disclose authentication state, and the internal `gh auth git-credential`
+// helper used by broker-spawned git is invoked by git itself, not via this
+// user-command path.
+func ValidateGhArguments(arguments []string) error {
+	for _, arg := range arguments {
+		if arg == "--show-token" || strings.HasPrefix(arg, "--show-token=") {
+			return fmt.Errorf("gh flag %s is not allowed", arg)
+		}
+	}
+	subcommand := ""
+	for i := 0; i < len(arguments); i++ {
+		arg := arguments[i]
+		if arg == "--" {
+			if i+1 < len(arguments) {
+				subcommand = arguments[i+1]
+			}
+			break
+		}
+		if strings.HasPrefix(arg, "-") {
+			// Skip values for known global flags that take a separate arg.
+			if arg == "-R" || arg == "--repo" || arg == "--hostname" {
+				i++
+			}
+			continue
+		}
+		subcommand = arg
+		break
+	}
+	if subcommand == "auth" {
+		return fmt.Errorf("gh auth commands are not allowed through the broker")
+	}
+	return nil
+}
+
 func ValidateGitArguments(arguments []string) error {
 	subcommand := ""
 	for i := 0; i < len(arguments); i++ {

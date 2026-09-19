@@ -118,6 +118,18 @@ func (b *Broker) Exec(ctx context.Context, req ExecRequest, stdin io.Reader, std
 	if req.Command[0] != "gh" && req.Command[0] != "git" {
 		return 0, fmt.Errorf("command must be gh or git, got %q", req.Command[0])
 	}
+	// Reject token-disclosure commands before minting: no credential is
+	// created for a request the runner would refuse.
+	if req.Command[0] == "gh" {
+		if err := runner.ValidateGhArguments(req.Command[1:]); err != nil {
+			return 0, err
+		}
+	}
+	if req.Command[0] == "git" {
+		if err := runner.ValidateGitArguments(req.Command[1:]); err != nil {
+			return 0, err
+		}
+	}
 
 	repository := req.Repository
 	if repository == "" {
