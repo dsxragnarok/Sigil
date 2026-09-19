@@ -1,5 +1,15 @@
 package sigil
 
+// The sigil CLI is a dumb admin-socket streaming client. It parses arguments,
+// sends metadata/stream frames to sigild, renders stdout/stderr, and exits
+// with the target exit code. It never loads role config, reads private keys,
+// mints credentials, discovers installations, touches cache state, or honors
+// SIGIL_CONFIG_DIR/SIGIL_CACHE_DIR.
+//
+// Explicit-role execution is the trusted/admin compatibility path and uses
+// the admin socket, which must only be reachable in trusted launcher
+// environments. Never export SIGIL_ADMIN_SOCKET into agent environments.
+
 import (
 	"context"
 	"errors"
@@ -8,14 +18,28 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
+
+	"sigil/internal/runtime"
+	utransport "sigil/internal/transport/unix"
 )
 
 const usage = `Usage:
   sigil exec <role> [--repo owner/name] [--installation-id id] -- <gh|git> [args...]
 
 Example:
-  sigil exec reviewer -- gh pr view 1 -R dsxragnarok/council`
+  sigil exec reviewer -- gh pr view 1 -R dsxragnarok/council
+
+Requires the trusted broker daemon (sigild) to be running.`
+
+// ExitError carries the target exit code from the broker exit frame so the
+// CLI exits with the same status. It is not a broker failure.
+type ExitError struct {
+	Code int
+}
+
+func (err *ExitError) Error() string {
+	return fmt.Sprintf("command exited with status %d", err.Code)
+}
 
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if stderr == nil {
@@ -37,79 +61,44 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return fmt.Errorf("%w\n\n%s", err, usage)
 	}
 
-	if dir := os.Getenv("SIGIL_CONFIG_DIR"); dir != "" {
-		fmt.Fprintf(stderr, "sigil: warning: SIGIL_CONFIG_DIR is set (%s); overriding config directory\n", dir)
-	}
-	if dir := os.Getenv("SIGIL_CACHE_DIR"); dir != "" {
-		fmt.Fprintf(stderr, "sigil: warning: SIGIL_CACHE_DIR is set (%s); overriding cache directory\n", dir)
+	// Client-supplied config/cache overrides have no effect: the broker owns
+	// its configuration and cache state. They are ignored, not warned about,
+	// so scripts cannot mistake client environment for daemon state.
+
+	workingDir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("determine working directory: %w", err)
 	}
 
-	config, _, err := LoadRoleConfig(request.role)
+	socketPath := adminSocketPath()
+	client := utransport.NewClient(socketPath, "/v1/exec")
+	code, err := client.Exec(ctx, utransport.Meta{
+		Role:           request.role,
+		Repository:     request.repository,
+		InstallationID: request.installationID,
+		WorkingDir:     workingDir,
+		Command:        request.command,
+	}, stdin, stdout, stderr)
 	if err != nil {
 		return err
 	}
-	repository := request.repository
-	if repository == "" {
-		repository = repositoryFromCommand(request.command)
+	if code != 0 {
+		return &ExitError{Code: code}
 	}
-	if repository == "" {
-		repository = config.DefaultRepository
-	}
-	if repository == "" && request.installationID == 0 && config.InstallationID == 0 {
-		return errors.New("no repository supplied; use --repo owner/name, a gh -R/--repo flag, or default_repository in the role config")
-	}
-	if repository != "" {
-		if _, _, err := splitRepository(repository); err != nil {
-			return err
-		}
-	}
+	return nil
+}
 
-	privateKey, err := LoadRSAPrivateKey(config.PrivateKeyPath)
+// adminSocketPath resolves the admin socket: explicit trusted-launcher
+// override first, otherwise the broker default runtime path.
+func adminSocketPath() string {
+	if override := os.Getenv("SIGIL_ADMIN_SOCKET"); override != "" {
+		return override
+	}
+	paths, err := runtime.Resolve()
 	if err != nil {
-		return err
+		return ""
 	}
-	appJWT, err := CreateAppJWT(config.ClientID, privateKey, time.Now())
-	if err != nil {
-		return err
-	}
-
-	installationID := request.installationID
-	if installationID == 0 {
-		installationID = config.InstallationID
-	}
-	if installationID == 0 && repository != "" {
-		installationID, err = cachedInstallationID(request.role, repository)
-		if err != nil {
-			return err
-		}
-	}
-	client := NewGitHubClient()
-	if installationID == 0 {
-		installationID, err = client.FindInstallation(ctx, appJWT, repository)
-		if err != nil {
-			return err
-		}
-		if err := cacheInstallationID(request.role, repository, installationID); err != nil {
-			return err
-		}
-	}
-
-	var tokenRepos []string
-	if repository != "" {
-		_, repoName, err := splitRepository(repository)
-		if err != nil {
-			return err
-		}
-		tokenRepos = []string{repoName}
-	} else {
-		fmt.Fprintln(stderr, "sigil: warning: minting unscoped installation token (access to all installation repositories)")
-	}
-
-	token, _, err := client.CreateInstallationToken(ctx, appJWT, installationID, tokenRepos...)
-	if err != nil {
-		return err
-	}
-	return runChild(ctx, request.command, token, repository, stdin, stdout, stderr)
+	return paths.AdminSocket
 }
 
 var errHelp = errors.New("help requested")
@@ -164,35 +153,4 @@ func parseArguments(args []string) (execRequest, error) {
 		return execRequest{}, fmt.Errorf("invalid role %q", request.role)
 	}
 	return request, nil
-}
-
-func repositoryFromCommand(command []string) string {
-	if len(command) == 0 || command[0] != "gh" {
-		return ""
-	}
-	for index := 1; index < len(command); index++ {
-		arg := command[index]
-		if arg == "--" {
-			break
-		}
-		var candidate string
-		switch {
-		case arg == "-R" || arg == "--repo":
-			if index+1 < len(command) {
-				candidate = command[index+1]
-				index++
-			}
-		case strings.HasPrefix(arg, "--repo="):
-			candidate = strings.TrimPrefix(arg, "--repo=")
-		case strings.HasPrefix(arg, "-R") && len(arg) > 2:
-			candidate = strings.TrimPrefix(arg, "-R")
-		}
-		if candidate != "" && !strings.HasPrefix(candidate, "-") {
-			trimmed := strings.TrimPrefix(candidate, "github.com/")
-			if _, _, err := splitRepository(trimmed); err == nil {
-				return trimmed
-			}
-		}
-	}
-	return ""
 }
