@@ -66,6 +66,15 @@ func writeErrorFrame(w http.ResponseWriter, status int, message string) {
 }
 
 func serveExec(w http.ResponseWriter, r *http.Request, exec Executor) {
+	// Full duplex is required for interactive use: the executor may write a
+	// prompt and flush before the client has finished uploading stdin. Without
+	// this, Go's HTTP/1 server waits for request EOF before starting the
+	// response, deadlocking prompt-then-answer exchanges.
+	// See https://pkg.go.dev/net/http#ResponseController.EnableFullDuplex
+	if rc := http.NewResponseController(w); rc != nil {
+		_ = rc.EnableFullDuplex()
+	}
+
 	// Bound the first line: the metadata frame must arrive promptly and fit
 	// MaxMetaFrameBytes. Per-frame and aggregate bounds below enforce the rest.
 	first, rest, err := readFirstLine(r.Body)
@@ -207,13 +216,23 @@ func serveExec(w http.ResponseWriter, r *http.Request, exec Executor) {
 	stderr := writerFunc(func(p []byte) (int, error) { write(TypeStderr, p); return len(p), nil })
 
 	code, err := exec.Exec(ctx, meta, stdinReader, stdout, stderr)
-	// Drain the scanner so a slow client cannot wedge the handler.
+	// Execution completion must not require the caller's stdin source to
+	// reach EOF (e.g. terminal stdin via `sigil exec ...` never closes).
+	// Fail closed on malformed streams already observed, but do not wait for
+	// terminal EOF: a brief grace catches in-flight malformed/truncated
+	// frames, while a still-blocked uploader is treated as terminal input,
+	// not a truncation. Handler return closes the request body and terminates
+	// the scanner goroutine.
 	_ = stdinReader.Close()
 	var scanResult error
 	select {
 	case scanResult = <-scanErr:
-	case <-time.After(TermGracePeriod):
-		scanResult = fmt.Errorf("timed out waiting for request stdin")
+	default:
+		select {
+		case scanResult = <-scanErr:
+		case <-time.After(100 * time.Millisecond):
+			scanResult = nil
+		}
 	}
 
 	mu.Lock()
@@ -276,13 +295,28 @@ func trimNewline(line []byte) []byte {
 
 // ServeOnSocket listens on a Unix socket created under umask 0077.
 func ServeOnSocket(path string, handler http.Handler) (net.Listener, *http.Server, error) {
+	return ServeOnSocketWithBase(path, handler, context.Background())
+}
+
+// ServeOnSocketWithBase listens like ServeOnSocket but derives every request
+// context from base (via http.Server.BaseContext). The daemon passes its
+// lifetime context here so SIGINT/SIGTERM cancellation propagates to active
+// executions and the runner's killTree path runs before exit.
+// See https://pkg.go.dev/net/http#Server.Shutdown (Shutdown alone does not
+// interrupt active connections).
+func ServeOnSocketWithBase(path string, handler http.Handler, base context.Context) (net.Listener, *http.Server, error) {
 	old := syscall.Umask(0o077)
 	defer syscall.Umask(old)
 	listener, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("listen on %s: %w", path, err)
 	}
-	server := &http.Server{Handler: handler}
+	server := &http.Server{
+		Handler: handler,
+		BaseContext: func(net.Listener) context.Context {
+			return base
+		},
+	}
 	go server.Serve(listener)
 	return listener, server, nil
 }

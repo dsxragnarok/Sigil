@@ -1,6 +1,7 @@
 package unix
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"io"
@@ -255,5 +256,177 @@ func TestTimeoutForDefaults(t *testing.T) {
 	}
 	if got := TimeoutFor(1 << 30); got != MaxExecTimeout {
 		t.Fatalf("TimeoutFor(huge) = %v, want clamp to %v", got, MaxExecTimeout)
+	}
+}
+
+func TestInteractiveFullDuplexPromptThenAnswer(t *testing.T) {
+	exec := ExecutorFunc(func(ctx context.Context, meta Meta, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+		if _, err := io.WriteString(stdout, "prompt"); err != nil {
+			return 0, err
+		}
+		buf := make([]byte, 64)
+		n, err := stdin.Read(buf)
+		if err != nil {
+			return 0, err
+		}
+		if string(buf[:n]) != "answer" {
+			return 0, io.ErrUnexpectedEOF
+		}
+		if _, err := io.WriteString(stdout, "done"); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	})
+	server := httptest.NewServer(AdminHandler(exec))
+	defer server.Close()
+
+	meta, err := EncodeMeta(Meta{Role: "reviewer", Command: []string{"gh"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	promptSeen := make(chan struct{})
+	bodyReader, bodyWriter := io.Pipe()
+	go func() {
+		if _, werr := bodyWriter.Write(meta); werr != nil {
+			_ = bodyWriter.CloseWithError(werr)
+			return
+		}
+		select {
+		case <-promptSeen:
+		case <-time.After(5 * time.Second):
+			_ = bodyWriter.CloseWithError(io.ErrUnexpectedEOF)
+			return
+		}
+		chunk, _ := EncodeFrame(EncodeData(TypeStdin, []byte("answer")))
+		if _, werr := bodyWriter.Write(chunk); werr != nil {
+			_ = bodyWriter.CloseWithError(werr)
+			return
+		}
+		eof, _ := EncodeFrame(Frame{Type: TypeStdinEOF})
+		_, _ = bodyWriter.Write(eof)
+		_ = bodyWriter.Close()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/v1/exec", bodyReader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-ndjson")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatalf("Do (deadlock without EnableFullDuplex?): %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+	scanner := bufio.NewScanner(response.Body)
+	scanner.Buffer(make([]byte, 64*1024), MaxStreamFrameBytes+1024)
+	var out strings.Builder
+	closeOnce := false
+	for scanner.Scan() {
+		frame, err := DecodeFrame(append([]byte(nil), scanner.Bytes()...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch frame.Type {
+		case TypeStdout:
+			data, _ := DecodeData(frame)
+			out.Write(data)
+			if strings.Contains(out.String(), "prompt") && !closeOnce {
+				closeOnce = true
+				close(promptSeen)
+			}
+		case TypeExit:
+			if out.String() != "promptdone" {
+				t.Fatalf("stdout = %q, want prompt+done interleaved", out.String())
+			}
+			return
+		case TypeError:
+			t.Fatalf("broker error: %s", frame.Message)
+		}
+	}
+	t.Fatal("stream ended without exit (full duplex deadlock?)")
+}
+
+func TestImmediateExitWithBlockingStdin(t *testing.T) {
+	exec := ExecutorFunc(func(ctx context.Context, meta Meta, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+		return 0, nil
+	})
+	server := httptest.NewServer(AdminHandler(exec))
+	defer server.Close()
+	client := &Client{HTTP: server.Client(), URL: server.URL + "/v1/exec", StdinChunk: 4}
+
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	type outcome struct {
+		code int
+		err  error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		var out bytes.Buffer
+		code, err := client.Exec(context.Background(), Meta{Role: "reviewer", Command: []string{"gh"}}, pr, &out, io.Discard)
+		done <- outcome{code, err}
+	}()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("blocking stdin turned success into error: %v", res.err)
+		}
+		if res.code != 0 {
+			t.Fatalf("code = %d, want 0", res.code)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("server waited for terminal stdin EOF (must return without EOF)")
+	}
+}
+
+func TestDaemonCancelInterruptsActiveExec(t *testing.T) {
+	daemonCtx, daemonCancel := context.WithCancel(context.Background())
+	defer daemonCancel()
+	started := make(chan struct{})
+	exec := ExecutorFunc(func(ctx context.Context, meta Meta, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+		close(started)
+		<-ctx.Done()
+		return 0, ctx.Err()
+	})
+	dir, err := os.MkdirTemp("/tmp", "sigil-daemon-cancel-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "a.sock")
+	listener, srv, err := ServeOnSocketWithBase(sock, AdminHandler(exec), daemonCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	defer srv.Close()
+
+	client := NewClient(sock, "/v1/exec")
+	type outcome struct {
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		_, err := client.Exec(context.Background(), Meta{Role: "reviewer", Command: []string{"gh"}}, nil, io.Discard, io.Discard)
+		done <- outcome{err}
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("executor never started")
+	}
+	daemonCancel()
+	select {
+	case res := <-done:
+		if res.err == nil {
+			t.Fatal("expected broker error after daemon cancel")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("active execution not cancelled by daemon context")
 	}
 }

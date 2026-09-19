@@ -225,6 +225,40 @@ func TestTimeoutTerminatesGrandchildren(t *testing.T) {
 	}
 }
 
+func TestCancelTerminatesProcessGroup(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "child.pid")
+	writeFake(t, dir, "gh", "#!/bin/sh\n/bin/sleep 60 & echo $! > \"$1\"\nwait\n")
+	setTestTrustedDirs(t, dir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	_, err := Run(ctx, Request{Command: []string{"gh", pidFile}, Token: "tok", Timeout: 60 * time.Second})
+	if err == nil || !strings.Contains(err.Error(), "cancelled") {
+		t.Fatalf("expected cancelled error, got %v", err)
+	}
+	if time.Since(start) > 15*time.Second {
+		t.Fatalf("cancel took too long: %v", time.Since(start))
+	}
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("child pid not recorded: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if err := syscall.Kill(pid, 0); err == nil {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		t.Fatal("cancelled grandchild still alive (daemon shutdown would orphan it)")
+	}
+}
+
 func TestStdinStreamsAndTargetFailureIsCode(t *testing.T) {
 	dir := t.TempDir()
 	writeFake(t, dir, "gh", "#!/bin/sh\n/bin/cat\nexit 3\n")

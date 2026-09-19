@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"sigil/internal/broker"
 	"sigil/internal/provider/github"
@@ -110,13 +111,22 @@ func run() error {
 		return err
 	}
 
-	agentListener, agentServer, err := utransport.ServeOnSocket(paths.AgentSocket, utransport.AgentHandler())
+	// Daemon-lifetime context: active executions derive from this via
+	// BaseContext, so SIGINT/SIGTERM cancellation propagates to runner.Run
+	// and the SIGTERM->SIGKILL killTree path runs. http.Server.Shutdown alone
+	// does not interrupt active connections; without this a long-running
+	// gh/git child could be orphaned with the broker credential in its env.
+	// See https://pkg.go.dev/net/http#Server.Shutdown
+	daemonCtx, daemonCancel := context.WithCancel(context.Background())
+	defer daemonCancel()
+
+	agentListener, agentServer, err := utransport.ServeOnSocketWithBase(paths.AgentSocket, utransport.AgentHandler(), daemonCtx)
 	if err != nil {
 		return err
 	}
 	defer agentListener.Close()
-	adminListener, adminServer, err := utransport.ServeOnSocket(paths.AdminSocket,
-		utransport.AdminHandler(utransport.ExecutorFunc(daemon.ExecTransport)))
+	adminListener, adminServer, err := utransport.ServeOnSocketWithBase(paths.AdminSocket,
+		utransport.AdminHandler(utransport.ExecutorFunc(daemon.ExecTransport)), daemonCtx)
 	if err != nil {
 		return err
 	}
@@ -128,10 +138,19 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	<-ctx.Done()
-	shutCtx, cancel := context.WithTimeout(context.Background(), utransport.TermGracePeriod)
+	// Cancel active executions first so the runner tears down the child
+	// process group, then wait for handlers to finish.
+	daemonCancel()
+	// Shutdown budget must cover the runner SIGTERM grace (5s) + SIGKILL reap
+	// (1s) plus transport overhead; TermGracePeriod alone (5s) is too short.
+	shutCtx, cancel := context.WithTimeout(context.Background(), utransport.TermGracePeriod+10*time.Second)
 	defer cancel()
-	_ = agentServer.Shutdown(shutCtx)
-	_ = adminServer.Shutdown(shutCtx)
+	if err := agentServer.Shutdown(shutCtx); err != nil {
+		return fmt.Errorf("agent shutdown: %w", err)
+	}
+	if err := adminServer.Shutdown(shutCtx); err != nil {
+		return fmt.Errorf("admin shutdown: %w", err)
+	}
 	return nil
 }
 
