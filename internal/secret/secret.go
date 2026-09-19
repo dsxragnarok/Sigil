@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -26,6 +27,11 @@ func (FileStore) Get(ctx context.Context, ref string) ([]byte, error) {
 		return nil, fmt.Errorf("empty secret reference")
 	}
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var err error
+	path, err = expandSecretPath(path)
+	if err != nil {
 		return nil, err
 	}
 	f, err := os.Open(path)
@@ -48,4 +54,18 @@ func (FileStore) Get(ctx context.Context, ref string) ([]byte, error) {
 		return nil, fmt.Errorf("read secret: %w", err)
 	}
 	return contents, nil
+}
+
+func expandSecretPath(path string) (string, error) {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("expand secret path: %w", err)
+		}
+		if path == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, strings.TrimPrefix(path, "~/")), nil
+	}
+	return path, nil
 }

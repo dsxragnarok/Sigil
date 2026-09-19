@@ -141,6 +141,9 @@ func Run(ctx context.Context, req Request) (int, error) {
 	child.Stderr = stderr
 	child.Env = childEnv(os.Environ(), req.Token, req.Repository, trustedPathStr, home, ghConfigDir)
 	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Disable the Go 1.20+ default Cancel (immediate SIGKILL on context
+	// expiry) so timeouts honor the SIGTERM grace period in killTree.
+	child.Cancel = func() error { return nil }
 
 	if err := child.Start(); err != nil {
 		return 0, fmt.Errorf("run %s: %w", program, err)
@@ -150,14 +153,14 @@ func Run(ctx context.Context, req Request) (int, error) {
 
 	select {
 	case waitErr := <-waitCh:
-		// Child exited first. If ctx also fired, make sure a cancelled tree
-		// cannot linger, then report the cancellation.
+		// Child exited first and waitCh is drained: do not call killTree
+		// here, it would block the full grace+reap timeouts on an empty
+		// channel. The child is reaped; just report timeout/cancel if the
+		// context also fired.
 		if ctx.Err() == context.DeadlineExceeded {
-			killTree(child, waitCh)
 			return 0, fmt.Errorf("%s execution timed out", program)
 		}
 		if ctx.Err() == context.Canceled {
-			killTree(child, waitCh)
 			return 0, fmt.Errorf("%s execution cancelled", program)
 		}
 		if waitErr != nil {
@@ -184,6 +187,9 @@ func Run(ctx context.Context, req Request) (int, error) {
 // reaped child, then SIGKILLs the group if anything remains.
 func killTree(child *exec.Cmd, waitCh <-chan error) {
 	if child.Process == nil {
+		return
+	}
+	if child.ProcessState != nil && child.ProcessState.Exited() {
 		return
 	}
 	_ = syscall.Kill(-child.Process.Pid, syscall.SIGTERM)

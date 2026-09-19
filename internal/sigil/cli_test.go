@@ -56,7 +56,7 @@ func TestClientIgnoresConfigAndCacheOverrides(t *testing.T) {
 func TestBrokerDownReportsUnavailable(t *testing.T) {
 	t.Setenv("SIGIL_ADMIN_SOCKET", filepath.Join(t.TempDir(), "dead.sock"))
 	err := Run(context.Background(), []string{"exec", "reviewer", "--", "gh", "status"}, nil, io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "sigil: broker unavailable: start sigild or configure SIGIL_SOCKET") {
+	if err == nil || !strings.Contains(err.Error(), "sigil: broker unavailable: start sigild or configure SIGIL_ADMIN_SOCKET") {
 		t.Fatalf("expected broker-unavailable error, got %v", err)
 	}
 }
