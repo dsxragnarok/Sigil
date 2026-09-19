@@ -1,8 +1,14 @@
 # Sigil
 
-`sigil` mints a short-lived token for a GitHub App role, puts it in the child process as `GH_TOKEN`, and runs `gh` or `git`. It does not print or persist the token. App JWTs expire after nine minutes. GitHub installation tokens expire after one hour.
+Sigil is a delegated identity and authorization broker for autonomous agents.
 
-The first role is `reviewer`, backed by the `dsxreviewer` GitHub App. Each future role gets its own JSON config and private key.
+Its job is to let an agent act through a narrowly scoped external identity without giving that agent the long-lived credential that owns the identity. The first provider is GitHub, using separate GitHub Apps for roles such as `reviewer`, `implementer`, and `tester`.
+
+The long-term model is broader than GitHub: Sigil should bind an agent session to a role, resolve that role to provider-specific identities, enforce policy, obtain short-lived credentials, perform authenticated operations, and record what happened.
+
+The core security rule is:
+
+> An agent may use an identity assigned to its session, but it may not select or escalate to a stronger identity itself.
 
 ## Build and install
 
