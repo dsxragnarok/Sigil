@@ -193,7 +193,7 @@ Primary responsibilities:
 - enforce repository and capability scope;
 - load secrets through the secret-store abstraction;
 - mint short-lived provider credentials;
-- execute compatibility commands without returning credentials to the caller;
+- execute compatibility commands without directly returning provider credentials to the caller;
 - write structured audit records;
 - own runtime directories, temporary execution state, configuration, and caches.
 
@@ -378,7 +378,7 @@ Provider code should receive secret material from the store rather than opening 
 
 The current `runner.go` hardening is valuable and should be preserved, but M1 changes who owns execution.
 
-**Locked execution model: Option A.** For remote Git operations, `sigild` itself spawns the trusted `git` executable. The agent never invokes a broker credential helper and never receives a bearer token.
+**Locked execution model: Option A.** For remote Git operations, `sigild` itself spawns the trusted `git` executable. The agent never invokes a broker credential helper, and the broker never directly returns a bearer token. Legitimate child output is scrubbed of exact token occurrences as defense in depth. M1 does not provide adversarial child-output secrecy, and untrusted M2 compatibility execution requires credential isolation first.
 
 The runner is responsible for compatibility-mode execution of `gh` and `git` while minimizing credential leakage and command-execution escape paths.
 
@@ -497,7 +497,7 @@ agent
   -> stream result back to agent
 ```
 
-There is no agent-facing Git credential-helper hop. Any helper used by the broker-spawned Git process is internal to the runner and cannot return the token to the agent.
+There is no agent-facing Git credential-helper hop. Any helper used by the broker-spawned Git process is internal to the runner and does not directly return the token to the agent. Exact token occurrences in legitimate output are scrubbed per-stream as defense in depth. Because M1 child processes inherit `GH_TOKEN` in their environment, M1 does not provide adversarial child-output secrecy, and untrusted M2 compatibility execution requires credential isolation first.
 
 For agent sessions:
 
