@@ -132,6 +132,37 @@ func TestBrokerTokenNeverAppearsInStreams(t *testing.T) {
 	}
 }
 
+func TestCrossStreamTokenSplitBypassesPerStreamRedactor(t *testing.T) {
+	// Demonstrates that independent per-stream redaction cannot enforce secrecy
+	// against child code that splits bearer material across stdout and stderr.
+	// Output filtering is defense in depth for accidental echo, not an adversarial
+	// credential boundary.
+	dir := t.TempDir()
+	writeFake(t, dir, "gh", "#!/bin/sh\n"+
+		"tok=\"$GH_TOKEN\"\n"+
+		"len=$(printf '%s' \"$tok\" | /usr/bin/wc -c | /usr/bin/tr -d ' ')\n"+
+		"half=$((len / 2))\n"+
+		"printf '%s' \"$tok\" | /bin/dd bs=1 count=$half 2>/dev/null\n"+
+		"(printf '%s' \"$tok\" | /bin/dd bs=1 skip=$half 2>/dev/null) >&2\n")
+	setTestTrustedDirs(t, dir)
+	token := "ghs_adversarial-split-token-xyz987"
+
+	var out, errOut bytes.Buffer
+	code, err := Run(context.Background(), Request{Command: []string{"gh"}, Token: token, Stdout: &out, Stderr: &errOut})
+	if err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	// Neither stream individually contains the full token, so neither was redacted.
+	if strings.Contains(out.String(), "[REDACTED]") || strings.Contains(errOut.String(), "[REDACTED]") {
+		t.Fatalf("unexpected redaction marker in individual streams")
+	}
+	// Concatenating the two caller-received streams recovers the full token.
+	combined := out.String() + errOut.String()
+	if !strings.Contains(combined, token) {
+		t.Fatalf("expected concatenated streams to reconstruct split token %q, got %q", token, combined)
+	}
+}
+
 func TestGhAuthDisclosureRejected(t *testing.T) {
 	dir := t.TempDir()
 	writeFake(t, dir, "gh", "#!/bin/sh\nexit 0\n")

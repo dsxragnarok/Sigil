@@ -3,9 +3,9 @@
 // GH_CONFIG_DIR, scrubbed personal-credential environment, suppressed Git
 // hooks, an explicit canonical working directory, and its own process group
 // so timeouts reap the whole tree. Credentials never appear in argv, temp
-// files, or error strings; child stdout/stderr is scrubbed of the broker
-// token and `gh auth` disclosure commands are rejected so bearer material
-// cannot cross IPC via output frames.
+// files, or error strings; child stdout/stderr is scrubbed of the raw broker
+// token and `gh auth` disclosure commands are rejected as defense in depth
+// against accidental token output.
 package runner
 
 import (
@@ -141,12 +141,13 @@ func Run(ctx context.Context, req Request) (int, error) {
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	// Bearer material must never cross IPC via child output. The broker
-	// credential lives in the child environment (required for gh/git HTTPS),
-	// so `gh auth token`, repo-local `!` aliases (`!env`, `!echo $GH_TOKEN`),
+	// The broker credential lives in the child environment (required for gh/git
+	// HTTPS), so `gh auth token`, repo-local `!` aliases (`!env`, `!echo $GH_TOKEN`),
 	// or helpers could otherwise echo it to stdout/stderr frames. Wrap both
 	// streams with a token-scrubbing filter; `gh auth` disclosure commands
 	// are rejected above, this is defense in depth for arbitrary output.
+	// Independent stream filters do not prevent cross-stream reassembly or
+	// bearer transformations by adversarial child code.
 	var stdoutFilter, stderrFilter *redactWriter
 	if req.Token != "" {
 		stdoutFilter = newRedactWriter(stdout, req.Token)

@@ -140,12 +140,13 @@ sigil exec implementer -- gh pr create ...
 
 - The private key stays in the broker process. Only the broker-spawned `gh`
   or `git` process receives the short-lived token, via environment.
-- Tokens never cross IPC, touch disk, or appear in logs, frames, or errors.
-  `gh auth` disclosure commands (`gh auth token`, `gh auth status
-  --show-token`, etc.) are rejected, and child stdout/stderr is scrubbed of
-  the bearer so `gh auth token`-style output, `!env` aliases, or helpers
-  cannot return raw bearer material in response frames.
-- The caller never receives the GitHub token.
+- The broker does not return the GitHub token in IPC frames, logs, or error
+  strings. `gh auth` disclosure commands (`gh auth token`, `gh auth status
+  --show-token`, etc.) are rejected before minting or execution. Child stdout
+  and stderr are scrubbed of the raw bearer as defense in depth against
+  accidental echo. Per-stream scrubbing is not a secrecy boundary against
+  adversarial code that can fragment or transform the bearer across streams.
+- In legitimate use, the caller never receives the GitHub token.
 - Binary resolution ignores caller `PATH` and searches only trusted system
   directories (`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`).
   The child process runs with this sanitized `PATH`.
@@ -158,17 +159,17 @@ sigil exec implementer -- gh pr create ...
   caller arguments: repository-controlled hooks never execute inside the
   broker tree. This is not complete repository-code isolation: repository-local
   Git config (`.git/config`, attributes) is still read, and repo-local aliases
-  or helpers prefixed with `!` execute shell commands (e.g. a repo-local
-  `.git/config` with `[alias] status = "!evil"` then `git status`,
+  or helpers prefixed with `!` execute shell commands (for example a repo-local
+  `.git/config` with `[alias] sigil-leak = "!evil"` then `git sigil-leak`,
   `core.pager`, `core.fsmonitor`, `filter.*`, `diff.*.command`,
   `merge.*.driver`). Caller `-c alias.*` overrides are already rejected by
   argument validation; the residual vector is repo-local config. Child
   stdout/stderr is scrubbed of the broker bearer so direct recovery via output
   frames is blocked, but repo-local execution inherits `GH_TOKEN` in its
-  environment and could exfiltrate via network. Treat untrusted checkouts as
-  residual risk until M2 constrains these vectors. Inspect repo-local
-  `.git/config` and `.gitattributes` before running against untrusted workdirs,
-  or run from outside the untrusted tree.
+  environment and could exfiltrate via network or cross-stream fragmentation.
+  Treat untrusted checkouts as residual risk until M2 constrains these vectors.
+  Inspect repo-local `.git/config` and `.gitattributes` before running against
+  untrusted workdirs, or run from outside the untrusted tree.
 - Dangerous `git` arguments are blocked, including `--upload-pack`,
   `--receive-pack`, `--exec`, `--exec-path`, `--template`, `--git-dir`,
   `--work-tree`, `--config-env`, `--config`, and `-C` (except for
@@ -185,10 +186,10 @@ sigil exec implementer -- gh pr create ...
 - Executions run in their own process group with a 120-second default
   timeout: on timeout the whole tree gets `SIGTERM`, then `SIGKILL` after a
   5-second grace period.
-- Target exit terminates the request-input side: `stdin_eof` is not required
-  once the child has exited. Malformed streams observed before exit still fail
-  closed; late frames after exit are irrelevant by definition (no wall-clock
-  grace).
+- Target exit terminates request-input consumption: `stdin_eof` is not required
+  once the child has exited. Stdin frames are consumed and validated on demand
+  while the target runs. Framing errors observed while feeding the target fail
+  closed (HTTP 400), while unconsumed input following target exit is discarded.
 - Same-user workstation mode prevents accidental credential fallback and API
   misuse. It does **not** make broker files unreadable to another process
   with the same UID. Enforced key secrecy requires a hard-isolation
