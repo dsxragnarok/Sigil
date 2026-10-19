@@ -408,11 +408,22 @@ func (r *redactWriter) Flush() error {
 // broker pins, with caller personal-credential state scrubbed before the
 // broker-minted credential is injected.
 func childEnv(environment []string, token, repository, trustedPathStr, home, ghConfigDir string) []string {
+	// Preserve proxy settings from the trusted broker launch environment so
+	// GitHub clients can use its approved network route. The client protocol
+	// does not forward environment variables into broker execution.
 	allowed := map[string]bool{
-		"USER": true,
-		"LANG": true,
-		"TZ":   true,
-		"TERM": true,
+		"USER":        true,
+		"LANG":        true,
+		"TZ":          true,
+		"TERM":        true,
+		"HTTP_PROXY":  true,
+		"HTTPS_PROXY": true,
+		"ALL_PROXY":   true,
+		"NO_PROXY":    true,
+		"http_proxy":  true,
+		"https_proxy": true,
+		"all_proxy":   true,
+		"no_proxy":    true,
 	}
 	var filtered []string
 	for _, entry := range environment {

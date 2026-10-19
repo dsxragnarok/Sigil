@@ -111,6 +111,46 @@ func TestPersonalCredentialEnvScrubbed(t *testing.T) {
 	}
 }
 
+func TestBrokerProxyEnvironmentPassedToChild(t *testing.T) {
+	dir := t.TempDir()
+	writeFake(t, dir, "gh", "#!/bin/sh\nprintf 'HTTP_PROXY=%s HTTPS_PROXY=%s ALL_PROXY=%s NO_PROXY=%s http_proxy=%s https_proxy=%s all_proxy=%s no_proxy=%s' \"$HTTP_PROXY\" \"$HTTPS_PROXY\" \"$ALL_PROXY\" \"$NO_PROXY\" \"$http_proxy\" \"$https_proxy\" \"$all_proxy\" \"$no_proxy\"\n")
+	setTestTrustedDirs(t, dir)
+	for _, entry := range []struct{ key, value string }{
+		{"HTTP_PROXY", "http://127.0.0.1:3128"},
+		{"HTTPS_PROXY", "http://127.0.0.1:3128"},
+		{"ALL_PROXY", "http://127.0.0.1:3128"},
+		{"NO_PROXY", "localhost,127.0.0.1"},
+		{"http_proxy", "http://127.0.0.1:3128"},
+		{"https_proxy", "http://127.0.0.1:3128"},
+		{"all_proxy", "http://127.0.0.1:3128"},
+		{"no_proxy", "localhost,127.0.0.1"},
+	} {
+		t.Setenv(entry.key, entry.value)
+	}
+
+	var out bytes.Buffer
+	code, err := Run(context.Background(), Request{
+		Command: []string{"gh"}, Token: "test-token", Stdout: &out,
+	})
+	if err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	for _, expected := range []string{
+		"HTTP_PROXY=http://127.0.0.1:3128",
+		"HTTPS_PROXY=http://127.0.0.1:3128",
+		"ALL_PROXY=http://127.0.0.1:3128",
+		"NO_PROXY=localhost,127.0.0.1",
+		"http_proxy=http://127.0.0.1:3128",
+		"https_proxy=http://127.0.0.1:3128",
+		"all_proxy=http://127.0.0.1:3128",
+		"no_proxy=localhost,127.0.0.1",
+	} {
+		if !strings.Contains(out.String(), expected) {
+			t.Fatalf("child environment missing %q: %q", expected, out.String())
+		}
+	}
+}
+
 func TestBrokerTokenNeverAppearsInStreams(t *testing.T) {
 	dir := t.TempDir()
 	// Fake gh echoes the token on both streams, fragmented across writes to
@@ -591,4 +631,3 @@ func TestInteractivePromptObservableBeforeStdinSupplied(t *testing.T) {
 		t.Fatalf("Run exit code = %d, want 0", runCode)
 	}
 }
-
